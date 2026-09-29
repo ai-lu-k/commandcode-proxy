@@ -15,7 +15,7 @@ import { createAlerts, defaultStatePath, normalizeAlerts } from './alerts.mjs';
 import {
   DEFAULT_DECISION_MODELS, DECISION_PLAN_HINTS, SYSTEMONE_PATH,
   normalizeDecisionModels, isDecisionModel, planAllowsDecision,
-  extractDecisionPayload, buildSystemoneBody, answersText, answersReport, decisionUsage,
+  extractDecisionPayload, buildSystemoneBody, answersText, answersReport, decisionUsage, nativeResponseObject,
   chatCompletionObject, chatStreamFrames, anthropicMessageObject, anthropicStreamFrames,
   responsesObject, responsesStreamFrames,
 } from './decision.mjs';
@@ -2227,7 +2227,7 @@ function wantsRawAnswers(req, body) {
  * 处理一次决策模型请求：解析 JSON 载荷 → 调 systemone → 按入站协议渲染。
  * 三种协议共用同一份 answers，只是外壳不同（中转站按各自协议计费）。
  */
-async function handleDecision({ req, res, protocol, model, stream, body, id, created }) {
+async function handleDecision({ req, res, protocol, model, stream, body, id, created, native = false }) {
   const payload = extractDecisionPayload(body, protocol);
   if (!payload.ok) {
     log('warn', 'Decision payload rejected', { model, protocol, code: payload.code, message: payload.error });
@@ -2258,6 +2258,10 @@ async function handleDecision({ req, res, protocol, model, stream, body, id, cre
     inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
     elapsedMs: Date.now() - started,
   });
+
+  // 原生端点：非流式直接回 jev 的原生响应 {model, answers, usage}，不套 chat 外壳。
+  // 流式仍走 chat 分帧 —— 只有分帧里带 usage，中转站才能计费。
+  if (native && !stream) return sendJSON(res, 200, nativeResponseObject({ model, answers, usage }));
 
   if (protocol === 'anthropic') {
     if (!stream) return sendJSON(res, 200, anthropicMessageObject({ id, model, text, usage }));
@@ -2315,6 +2319,7 @@ async function handleSystemone(req, res) {
     body,
     id: `chatcmpl-${randomUUID().slice(0, 12)}`,
     created: nowUnix(),
+    native: true,
   });
 }
 

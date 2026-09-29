@@ -299,6 +299,25 @@ export function chatCompletionObject({ id, created, model, text, usage, answers 
   };
 }
 
+/**
+ * jev 原生响应（不套 chat 外壳）：{model, answers, usage}。
+ * usage 里除了 CC 原生的 input_tokens/output_tokens，另外补上 prompt_tokens/completion_tokens，
+ * 因为中转站（newapi）只按 chat 口径读这两个键计费 —— 少了就是 0 费。
+ */
+export function nativeResponseObject({ model, answers, usage }) {
+  return {
+    model,
+    answers,
+    usage: {
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      prompt_tokens: usage.promptTokens,
+      completion_tokens: usage.completionTokens,
+      total_tokens: usage.totalTokens,
+    },
+  };
+}
+
 /** /v1/chat/completions 的 SSE 分帧（答案一次性给出，所以只有 3~4 帧） */
 export function chatStreamFrames({ id, created, model, text, usage, includeUsage = false }) {
   const head = { id, object: 'chat.completion.chunk', created, model };
