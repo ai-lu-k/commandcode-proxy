@@ -12,6 +12,13 @@ import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync, mk
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createAlerts, defaultStatePath, normalizeAlerts } from './alerts.mjs';
+import {
+  DEFAULT_DECISION_MODELS, DECISION_PLAN_HINTS, SYSTEMONE_PATH,
+  normalizeDecisionModels, isDecisionModel, planAllowsDecision,
+  extractDecisionPayload, buildSystemoneBody, answersText, answersReport, decisionUsage,
+  chatCompletionObject, chatStreamFrames, anthropicMessageObject, anthropicStreamFrames,
+  responsesObject, responsesStreamFrames,
+} from './decision.mjs';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -94,6 +101,11 @@ const SETTINGS_DEFAULTS = {
   creditsRefreshMs: 15 * 60 * 1000, // 服务端定时刷新额度间隔（默认 15 分钟），0 = 关闭
   autoDisableExhausted: true,    // 额度用尽自动停用（额度恢复后自动恢复）
   onAllExhausted: 'error',       // 池内全部不可用时：error（明确报错）| best-effort（仍然尝试）
+  // 决策模型（typesafe/jev）：不是 chat 模型，只有 Provider API 的 /provider/v1/systemone，
+  // 且要求 GOAT 及以上套餐。requested model 命中 decisionModels 时走决策通道。
+  decisionModels: [...DEFAULT_DECISION_MODELS],
+  decisionPlans: [...DECISION_PLAN_HINTS], // plan 等于/以 -hint 结尾才允许调决策模型
+  decisionKeyIds: [],            // 显式指定可用 Key（填了就忽略套餐判断）
 };
 
 let keyStore = {
@@ -127,6 +139,12 @@ function normalizeSettings(raw) {
   s.onAllExhausted = s.onAllExhausted === 'best-effort' ? 'best-effort' : 'error';
   // 告警配置（余额/失败率阈值 + 邮件/webhook 通道）随 Key 池一起持久化到 keys.json
   s.alerts = normalizeAlerts(raw?.alerts);
+  // 决策模型（jev）配置
+  s.decisionModels = normalizeDecisionModels(s.decisionModels);
+  s.decisionPlans = Array.isArray(s.decisionPlans) && s.decisionPlans.length
+    ? s.decisionPlans.map((x) => String(x).trim()).filter(Boolean)
+    : [...DECISION_PLAN_HINTS];
+  s.decisionKeyIds = Array.isArray(s.decisionKeyIds) ? s.decisionKeyIds.map((x) => String(x).trim()).filter(Boolean) : [];
   return s;
 }
 
@@ -2060,6 +2078,246 @@ async function forwardToCCWithFailover(body, clientKey, req, signal, promptCache
   return { error: lastMapped || mapCcError(502, 'All upstream keys failed'), pick: lastPick };
 }
 
+// ── 决策模型（jev）──────────────────────────────────
+// CC 的决策模型不是 chat 模型：只有 Provider API 的 /provider/v1/systemone，
+// 且要求 GOAT 及以上套餐；站上的 chat/messages/responses 三种形状由 decision.mjs 翻译。
+
+const DECISION_TIMEOUT_MS = (() => {
+  const ms = Number.parseInt(process.env.CC_DECISION_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(ms) && ms > 0 ? ms : 60000;
+})();
+
+/** 某个 Key 是否允许调决策模型：显式名单优先，否则看套餐（GOAT 及以上） */
+function keyAllowsDecision(k) {
+  const s = keyStore.settings;
+  const ids = Array.isArray(s.decisionKeyIds) ? s.decisionKeyIds : [];
+  if (ids.length) return ids.includes(k.id);
+  return planAllowsDecision(k.credits?.plan, s.decisionPlans);
+}
+
+/** 决策模型专用的 Key 选取（只从满足套餐要求的 Key 里按策略挑） */
+function pickDecisionKey(excludeTried) {
+  const candidates = keyStore.keys.filter((k) => k.enabled && k.key
+    && !excludeTried?.has(k.id) && isKeyReady(k) && keyAllowsDecision(k));
+  if (!candidates.length) return null;
+  const req = { headers: {}, socket: { remoteAddress: '' } };
+  const entry = pickByStrategy(candidates, req, '');
+  if (!entry) return null;
+  markKeyUsed(entry);
+  return { apiKey: entry.key, id: entry.id, label: entry.label };
+}
+
+function decisionEligibleKeys(now = Date.now()) {
+  return keyStore.keys.filter((k) => k.enabled && k.key && keyAllowsDecision(k) && isKeyUsable(k, now));
+}
+
+/** 调 Provider API 的 systemone（决策模型唯一入口） */
+async function decisionCall(pick, model, payload, signal) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'User-Agent': 'cli',
+    'x-command-code-version': CC_VERSION,
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
+    'Authorization': `Bearer ${pick.apiKey}`,
+  };
+  if (CFG.zdr) headers['x-cmd-zdr'] = '1';
+  const response = await upstreamFetch(`${CFG.apiBase}${SYSTEMONE_PATH}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(buildSystemoneBody(model, payload)),
+    signal,
+  });
+  if (!response.ok) {
+    return { ok: false, status: response.status, text: await response.text().catch(() => '') };
+  }
+  const json = await response.json().catch(() => null);
+  if (!json) return { ok: false, status: 502, text: '上游返回了非 JSON 响应' };
+  return { ok: true, json };
+}
+
+/** 决策模型请求的 Key 轮换（结构对齐 forwardToCCWithFailover，但载荷是 systemone JSON） */
+async function forwardDecisionWithFailover(model, payload, signal) {
+  const maxKeys = Math.max(1, 1 + Math.max(0, Number(keyStore.lb.maxRetries) || 0));
+  const tried = new Set();
+  let lastError = null;
+  let lastPick = null;
+
+  for (let i = 0; i < maxKeys; i++) {
+    const pick = pickDecisionKey(tried);
+    if (!pick) break;
+    tried.add(pick.id);
+    lastPick = pick;
+    try {
+      const r = await decisionCall(pick, model, payload, signal);
+      if (r.ok) {
+        markKeySuccess(pick);
+        return { result: r.json, pick };
+      }
+      const text = String(r.text || '');
+      log('error', 'Decision model upstream error', {
+        model, keyId: pick.id, status: r.status, body: summarizeUpstreamError(text),
+      });
+      const mapped = mapCcError(r.status, text);
+      const retryable = isRetryableCcFailure(r.status, text);
+      markKeyFailure(pick, r.status, retryable, classifyFailure(r.status, text), text);
+      lastError = {
+        status: mapped.status,
+        code: mapped.code || 'upstream_error',
+        message: mapped.body.error.message,
+        retryAfter: mapped.body.retry_after,
+      };
+      if (!retryable) break;      // 参数/权限类错误换 Key 也没用
+    } catch (e) {
+      if (signal?.aborted) throw e;
+      log('error', 'Decision forward failed', { model, keyId: pick.id, message: e.message });
+      markKeyFailure(pick, 0, true, 'any-error');
+      lastError = { status: 502, code: 'upstream_error', message: `上游请求失败：${e.message}` };
+    }
+  }
+
+  if (!lastError) {
+    const plans = keyStore.settings.decisionPlans.join(' / ');
+    lastError = {
+      status: 503,
+      code: 'no_decision_key',
+      message: `没有可用于决策模型的 Key：jev 需要 GOAT 及以上套餐（Provider API 权限，当前要求 plan 含 ${plans}），`
+        + '且额度未用尽/未冷却。请在管理台 http://<host>:<port>/ 检查 Goat Key。',
+    };
+  }
+  return { error: lastError, pick: lastPick };
+}
+
+function sendDecisionError(res, protocol, status, type, message, retryAfter) {
+  if (protocol === 'anthropic') return sendAnthropicError(res, status, type, message, retryAfter);
+  if (protocol === 'responses') return sendResponsesError(res, status, type, message, retryAfter);
+  return sendJSON(res, status, {
+    error: { message, type, ...(type ? { code: type } : {}) },
+    ...(retryAfter !== undefined ? { retry_after: retryAfter } : {}),
+  });
+}
+
+const SSE_HEAD = {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  'Connection': 'keep-alive',
+  'X-Accel-Buffering': 'no',
+};
+
+/** 要原始 JSON 而不是人类可读报告：?raw=1 / ?format=json / 请求体 {"raw":true} / 头 X-Jev-Raw: 1 */
+function wantsRawAnswers(req, body) {
+  if (body?.raw === true) return true;
+  const fmt = String(body?.format || '').toLowerCase();
+  if (fmt === 'raw' || fmt === 'json') return true;
+  const h = String(req?.headers?.['x-jev-raw'] ?? '').trim().toLowerCase();
+  if (h === '1' || h === 'true' || h === 'yes') return true;
+  try {
+    const q = new URL(req?.url || '', 'http://placeholder').searchParams;
+    const raw = String(q.get('raw') ?? '').trim().toLowerCase();
+    if (raw === '' && q.has('raw')) return true;
+    if (raw === '1' || raw === 'true' || raw === 'yes') return true;
+    const f = String(q.get('format') ?? '').toLowerCase();
+    if (f === 'raw' || f === 'json') return true;
+  } catch { /* 没有 URL 就只看上面的来源 */ }
+  return false;
+}
+
+/**
+ * 处理一次决策模型请求：解析 JSON 载荷 → 调 systemone → 按入站协议渲染。
+ * 三种协议共用同一份 answers，只是外壳不同（中转站按各自协议计费）。
+ */
+async function handleDecision({ req, res, protocol, model, stream, body, id, created }) {
+  const payload = extractDecisionPayload(body, protocol);
+  if (!payload.ok) {
+    log('warn', 'Decision payload rejected', { model, protocol, code: payload.code, message: payload.error });
+    return sendDecisionError(res, protocol, payload.status || 400, payload.code || 'invalid_request_error', payload.error);
+  }
+
+  const started = Date.now();
+  let outcome;
+  try {
+    outcome = await forwardDecisionWithFailover(model, payload, AbortSignal.timeout(DECISION_TIMEOUT_MS));
+  } catch (e) {
+    log('error', 'Decision request failed', { model, message: e.message });
+    return sendDecisionError(res, protocol, 502, 'upstream_error', `决策模型请求失败：${e.message}`);
+  }
+  if (outcome.error) {
+    return sendDecisionError(res, protocol, outcome.error.status, outcome.error.code, outcome.error.message, outcome.error.retryAfter);
+  }
+
+  const usage = decisionUsage(outcome.result?.usage);
+  const answers = outcome.result?.answers;
+  // 默认给人看的报告；要原始 JSON 用 ?raw=1 —— 原始对象始终在响应的 answers 字段里
+  const raw = wantsRawAnswers(req, body);
+  const text = raw ? answersText(answers) : answersReport(answers);
+  log('info', 'Decision model answered', {
+    model, protocol, streaming: stream,
+    keyId: outcome.pick?.id, label: outcome.pick?.label,
+    questions: Object.keys(payload.questions).length,
+    inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+    elapsedMs: Date.now() - started,
+  });
+
+  if (protocol === 'anthropic') {
+    if (!stream) return sendJSON(res, 200, anthropicMessageObject({ id, model, text, usage }));
+    res.writeHead(200, SSE_HEAD);
+    for (const frame of anthropicStreamFrames({ id, model, text, usage })) res.write(frame);
+    return res.end();
+  }
+
+  if (protocol === 'responses') {
+    if (!stream) return sendJSON(res, 200, responsesObject({ id, created, model, text, usage }));
+    res.writeHead(200, SSE_HEAD);
+    for (const frame of responsesStreamFrames({ id, created, model, text, usage })) res.write(frame);
+    return res.end();
+  }
+
+  const includeUsage = body?.stream_options?.include_usage === true;
+  if (!stream) return sendJSON(res, 200, chatCompletionObject({ id, created, model, text, usage, answers }));
+  res.writeHead(200, SSE_HEAD);
+  for (const frame of chatStreamFrames({ id, created, model, text, usage, includeUsage })) res.write(frame);
+  return res.end();
+}
+
+/**
+ * 原生 systemone 入口：POST /provider/v1/systemone
+ * 请求体就是 CC 的原生形状（{model, state, questions}），不需要 messages ——
+ * 中转站（newapi 自定义渠道 + 透传请求体）把客户端请求原样打到这个路径，
+ * 客户端因此可以一直用原生协议，而计费仍由中转站按响应里的 usage 完成。
+ * 响应保持 chat 形状（带 usage）+ answers 字段（直连调用方拿原始对象）。
+ */
+async function handleSystemone(req, res) {
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    if (e.statusCode === 413) {
+      sendJSON(res, 413, { error: { message: e.message, type: 'invalid_request_error' } });
+      return;
+    }
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const settings = keyStore.settings;
+  const wanted = String(body?.model ?? '').trim();
+  const model = wanted || settings.decisionModels[0] || DEFAULT_DECISION_MODELS[0];
+  if (wanted && !isDecisionModel(wanted, settings.decisionModels)) {
+    log('warn', 'Native systemone called with a non-decision model', { requested: wanted });
+  }
+  await handleDecision({
+    req,
+    res,
+    protocol: 'chat',
+    model,
+    stream: body?.stream === true,
+    body,
+    id: `chatcmpl-${randomUUID().slice(0, 12)}`,
+    created: nowUnix(),
+  });
+}
+
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
@@ -2086,6 +2344,12 @@ async function handleChatCompletions(req, res) {
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
+
+  // 决策模型（jev）：不是 chat 模型，走 Provider API 的 systemone，载荷从消息内容里的 JSON 取
+  if (isDecisionModel(model, keyStore.settings.decisionModels)) {
+    await handleDecision({ req, res, protocol: 'chat', model, stream, body: openaiReq, id: completionId, created });
+    return;
+  }
 
   // 构建 CC 请求体
   const ccBody = buildCcRequest(openaiReq);
@@ -2996,6 +3260,15 @@ async function handleMessages(req, res) {
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
 
+  // 决策模型（jev）：按 Anthropic 形状渲染（content 里放 answers JSON）
+  if (isDecisionModel(model, keyStore.settings.decisionModels)) {
+    await handleDecision({
+      req, res, protocol: 'anthropic', model, stream, body: anthropicReq,
+      id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`, created: nowUnix(),
+    });
+    return;
+  }
+
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
@@ -3823,6 +4096,13 @@ async function handleResponses(req, res) {
   const model = chatReq.model || 'deepseek/deepseek-v4-flash';
   const responseId = newResponsesId('resp_');
   const created = nowUnix();
+
+  // 决策模型（jev）：按 Responses 形状渲染
+  if (isDecisionModel(model, keyStore.settings.decisionModels)) {
+    await handleDecision({ req, res, protocol: 'responses', model, stream, body: respReq, id: responseId, created });
+    return;
+  }
+
   const echoOpts = {
     instructions: respReq.instructions === undefined ? null : respReq.instructions,
     max_output_tokens: respReq.max_output_tokens === undefined ? null : respReq.max_output_tokens,
@@ -4440,6 +4720,43 @@ async function handleAdminApi(req, res, url) {
     return sendJSON(res, 200, alerts.clear({ history: url.searchParams.get('history') === '1' }));
   }
 
+  // 决策模型（jev）：给管理台看哪些 Key 满足 GOAT 及以上套餐
+  if (path === '/decision') {
+    const s = keyStore.settings;
+    if (req.method === 'GET') {
+      return sendJSON(res, 200, {
+        models: s.decisionModels,
+        plans: s.decisionPlans,
+        keyIds: s.decisionKeyIds,
+        upstreamPath: SYSTEMONE_PATH,
+        timeoutMs: DECISION_TIMEOUT_MS,
+        eligible: decisionEligibleKeys().map((k) => ({ id: k.id, label: k.label, plan: k.credits?.plan || null })),
+        keys: keyStore.keys.filter((k) => k.enabled).map((k) => ({
+          id: k.id,
+          label: k.label,
+          plan: k.credits?.plan || null,
+          usable: isKeyUsable(k),
+          allowedByPlan: keyAllowsDecision(k),
+          selected: keyAllowsDecision(k) && isKeyUsable(k),
+        })),
+      });
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      keyStore.settings = normalizeSettings({ ...keyStore.settings, ...body });
+      saveKeyStore();
+      log('info', 'Decision model settings updated from admin', {
+        models: keyStore.settings.decisionModels, plans: keyStore.settings.decisionPlans,
+      });
+      return sendJSON(res, 200, {
+        models: keyStore.settings.decisionModels,
+        plans: keyStore.settings.decisionPlans,
+        keyIds: keyStore.settings.decisionKeyIds,
+      });
+    }
+  }
+
   if (path === '/settings') {
     if (req.method === 'GET') {
       // alerts 里的 SMTP 密码不回传（masked 后 pass 恒为空）
@@ -4645,6 +4962,9 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
+    } else if (url.pathname === SYSTEMONE_PATH && req.method === 'POST') {
+      // 原生 systemone 入口（newapi 自定义渠道/直连脚本用），见 handleSystemone
+      await handleSystemone(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
@@ -4730,6 +5050,14 @@ server.listen(CFG.port, CFG.host, () => {
     alertsThresholds: (() => {
       const c = alerts.config();
       return `余额 < ${c.minCreditsPerKey} / 窗口 ≥ ${c.windowPctWarn}% / 失败率 ≥ ${c.failureRateWarn}%（${Math.round(c.windowMs / 1000)}s 窗口）`;
+    })(),
+    decisionModels: (() => {
+      const s = keyStore.settings;
+      const eligible = decisionEligibleKeys();
+      const detail = eligible.length
+        ? `可用 Key ${eligible.length} 个：${eligible.map((k) => k.label || k.id).join(' / ')}`
+        : `⚠ 没有满足 ${s.decisionPlans.join('/')} 套餐的可用 Key`;
+      return `${s.decisionModels.join(', ')} → ${SYSTEMONE_PATH}（${detail}）`;
     })(),
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {

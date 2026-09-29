@@ -101,6 +101,7 @@ export async function startProxy({ upstreamPort, env = {}, cwd } = {}) {
   const workdir = cwd ?? mkdtempSync(join(tmpdir(), 'ccp-test-'));
   copyFileSync(join(REPO, 'proxy.mjs'), join(workdir, 'proxy.mjs'));
   copyFileSync(join(REPO, 'alerts.mjs'), join(workdir, 'alerts.mjs'));   // proxy.mjs 依赖的告警模块
+  copyFileSync(join(REPO, 'decision.mjs'), join(workdir, 'decision.mjs')); // proxy.mjs 依赖的决策模型适配层
   if (!existsSync(join(workdir, 'config.json'))) {
     copyFileSync(join(REPO, 'config.json'), join(workdir, 'config.json'));
   }

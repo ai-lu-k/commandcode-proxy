@@ -1,6 +1,6 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json proxy.mjs alerts.mjs index.html admin.css admin.js ./
+COPY package.json proxy.mjs alerts.mjs decision.mjs index.html admin.css admin.js ./
 # Key 池落在 /app/data：可挂卷持久化（见 docker-compose.yml），
 # 不挂卷时重建容器会丢 Key（告警配置与状态也在这个卷里）。
 RUN mkdir -p /app/data
