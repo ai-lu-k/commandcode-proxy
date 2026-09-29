@@ -171,6 +171,7 @@
     },
     creditsRefresh: null,
     sessions: [],
+    alerts: null,
     serverSkew: 0,
     tab: 'keys',
     filter: 'all',
@@ -483,7 +484,7 @@
   }
 
   /* ── 标签页 ──────────────────────────────────────────── */
-  const TABS = ['keys', 'routing', 'sessions'];
+  const TABS = ['keys', 'routing', 'sessions', 'alerts'];
   const TAB_STORE_KEY = 'cc-proxy-tab';
 
   function setTab(name, { save = true } = {}) {
@@ -507,6 +508,7 @@
       try { history.replaceState(null, '', '#' + t); } catch { location.hash = t; }
     }
     if (t === 'sessions') refreshSessions();
+    if (t === 'alerts') refreshAlerts();
   }
 
   function initialTab() {
@@ -546,6 +548,13 @@
     // 调度标签上点一个绿点，表示服务端定时轮询开着
     const dot = $('#tabRouteDot');
     if (dot) dot.hidden = !(Number(state.settings.creditsRefreshMs) > 0);
+    // 告警标签显示未恢复告警数（0 就不显示徽标）
+    const alertCount = $('#tabAlertsCount');
+    if (alertCount) {
+      const n = (state.alerts?.active || []).length;
+      alertCount.textContent = String(n);
+      alertCount.hidden = !n;
+    }
   }
 
   /** 会话列表单独刷新（很轻，不动额度） */
@@ -558,6 +567,265 @@
       renderSessions();
     } catch { /* 静默失败，下一轮再试 */ }
   }
+
+  /* ── 告警（余额 / 失败率预警） ───────────────────────── */
+  const ALERT_LEVEL_TEXT = { critical: '严重', warn: '警告', recovery: '已恢复' };
+  let lastAlertFetch = 0;
+
+  async function refreshAlerts() {
+    lastAlertFetch = Date.now();
+    try {
+      const res = await api('/admin/api/alerts');
+      state.alerts = res;
+      if (res?.config) state.settings.alerts = res.config;
+      fillAlerts(res);
+      renderAlerts();
+    } catch (e) {
+      toast('告警状态加载失败：' + e.message, 'err');
+    }
+  }
+
+  /** 只更新告警状态与标签徽标，不动表单（避免刷掉正在编辑的输入） */
+  async function refreshAlertsSilent() {
+    lastAlertFetch = Date.now();
+    try {
+      const res = await api('/admin/api/alerts');
+      state.alerts = res;
+      if (res?.config) state.settings.alerts = res.config;
+      renderTabBadges();
+    } catch { /* 静默失败，下一轮再试 */ }
+  }
+
+  function syncAlertChannelBoxes() {
+    $('#alertEmailBox').classList.toggle('hidden', !$('#alertEmailOn').checked);
+    $('#alertHookBox').classList.toggle('hidden', !$('#alertWebhookOn').checked);
+  }
+
+  function fillAlerts(stats) {
+    const c = stats?.config || stats;
+    if (!c) return;
+    const e = c.email || {};
+    const w = c.webhook || {};
+    $('#alertEnabled').checked = c.enabled !== false;
+    $('#alertEmailOn').checked = !!(c.channels && c.channels.email);
+    $('#alertWebhookOn').checked = !!(c.channels && c.channels.webhook);
+    $('#alertSmtpHost').value = e.host || '';
+    $('#alertSmtpPort').value = e.port ?? 465;
+    $('#alertSmtpUser').value = e.user || '';
+    $('#alertSmtpPass').value = '';
+    $('#alertSmtpPass').placeholder = e.passSet ? '已设置（留空 = 不修改）' : 'SMTP 授权码';
+    $('#alertPassHint').textContent = e.passSet ? '已保存密码；要清除请勾选下方「清除已保存的密码」' : 'QQ/163 邮箱填授权码，不是登录密码';
+    $('#alertPassClear').checked = false;
+    $('#alertSmtpFrom').value = e.from || '';
+    $('#alertSmtpTo').value = (e.to || []).join(', ');
+    $('#alertSmtpSecure').checked = e.secure !== false;
+    $('#alertSmtpPlain').checked = !!e.allowPlaintextAuth;
+    $('#alertHookUrl').value = w.url || '';
+    $('#alertHookType').value = w.type || 'auto';
+    $('#alertMinCredits').value = c.minCreditsPerKey;
+    $('#alertMinUsable').value = c.minUsableKeys;
+    $('#alertWinWarn').value = c.windowPctWarn;
+    $('#alertWinCrit').value = c.windowPctCritical;
+    $('#alertFetchFail').value = c.creditsFetchFailWarn;
+    $('#alertWindowSec').value = Math.round(Number(c.windowMs) / 1000);
+    $('#alertMinSamples').value = c.minSamples;
+    $('#alertRateWarn').value = c.failureRateWarn;
+    $('#alertRateCrit').value = c.failureRateCritical;
+    $('#alertConsecutive').value = c.consecutiveFailuresCritical;
+    $('#alertQuotaFaults').value = c.quotaFaultsCritical;
+    $('#alertStalls').value = c.stallsWarn;
+    $('#alertInflight').value = c.inflightWarn;
+    $('#alertCooldownMin').value = Math.round(Number(c.cooldownMs) / 60000);
+    $('#alertMaxHour').value = c.maxSendsPerHour;
+    $('#alertRepeat').checked = !!c.repeatWhenStuck;
+    $('#alertRecovery').checked = c.notifyRecovery !== false;
+    syncAlertChannelBoxes();
+  }
+
+  function alertItemHtml(a, { history = false } = {}) {
+    const lv = a.level === 'critical' ? 'crit' : a.level === 'recovery' ? 'rec' : 'warn';
+    const status = history
+      ? ({ sent: '已发送', failed: '发送失败', 'log-only': '仅记录（未配通道）', disabled: '已关闭发送', 'rate-limited': '超出小时限额' }[a.status] || a.status)
+      : '';
+    const channels = (a.channels || []).length ? ` · ${a.channels.join('+')}` : '';
+    return `<div class="alert-item ${lv}">
+      <span class="alert-tag">${ALERT_LEVEL_TEXT[a.level] || a.level}</span>
+      <div class="alert-body">
+        <b>${escapeHtml(a.title || '')}</b>
+        ${a.detail ? `<span>${escapeHtml(a.detail)}</span>` : ''}
+        <small>${history
+          ? `${fmtTime(a.at)}${status ? ` · ${status}` : ''}${channels}`
+          : `触发于 ${fmtTime(a.firstAt)} · ${a.sends ? `已发送 ${a.sends} 次（最近 ${fmtTime(a.lastSentAt)}）` : '尚未发送'}`}</small>
+      </div>
+    </div>`;
+  }
+
+  function renderAlerts() {
+    const s = state.alerts;
+    if (!$('#alertActive')) return;
+    renderTabBadges();
+
+    const active = s?.active || [];
+    $('#alertActive').innerHTML = active.length
+      ? active.map((a) => alertItemHtml(a)).join('')
+      : '<p class="empty sm"><span class="empty-icon" aria-hidden="true">'
+        + icon('shield') + '</span><span>当前没有未恢复的告警。</span></p>';
+
+    const hist = s?.history || [];
+    $('#alertHistory').innerHTML = hist.length
+      ? `<h3 class="alert-group-title">最近通知</h3>${hist.slice(0, 30).map((a) => alertItemHtml(a, { history: true })).join('')}`
+      : '';
+
+    // 状态卡片：窗口失败率 / 通道就绪 / 上次发送结果
+    const box = $('#alertStatus');
+    if (!box || !s) return;
+    const w = s.window || {};
+    const counters = s.counters || {};
+    const last = s.lastSend;
+    const eff = s.config?.effective || {};
+    const rateTone = s.config && w.rate >= s.config.failureRateCritical && w.total >= s.config.minSamples
+      ? 'crit' : (s.config && w.rate >= s.config.failureRateWarn && w.total >= s.config.minSamples ? 'warn' : 'ok');
+
+    box.innerHTML = `
+      <div class="ps-row"><span>告警通道</span><b>${eff.logOnly
+        ? '未配置（仅日志）'
+        : [eff.emailReady ? '邮件' : null, eff.webhookReady ? 'Webhook' : null].filter(Boolean).join(' + ')}</b></div>
+      <div class="ps-row"><span>近 ${fmtDuration(w.windowMs || 0)} 窗口</span><b class="tone-${rateTone}">${w.total || 0} 个请求 · 失败 ${w.failed || 0}（${w.rate || 0}%）</b></div>
+      <div class="ps-row"><span>连续失败</span><b>${counters.consecutiveFailures || 0} 次</b></div>
+      <div class="ps-row"><span>本周期的告警次数</span><b>${counters.sentLastHour || 0} / ${counters.maxSendsPerHour || 0}（每小时上限）</b></div>
+      <div class="ps-row"><span>上次发送</span><b>${last
+        ? `${fmtTime(last.at)} · ${last.ok ? `成功（${(last.channels || []).join('+') || '—'}）` : `失败：${escapeHtml(last.error || '未知原因')}`}`
+        : '尚未发送过'}</b></div>
+      <div class="ps-row"><span>状态文件</span><b>${escapeHtml(s.statePath || '—')}</b></div>
+      ${s.lastError ? `<div class="ps-row"><span>最近错误</span><b class="tone-crit">${escapeHtml(s.lastError)}</b></div>` : ''}`;
+  }
+
+  /** 把表单读成 API 需要的 patch */
+  function alertFormPatch() {
+    const passClear = $('#alertPassClear').checked;
+    const passTyped = $('#alertSmtpPass').value;
+    return {
+      enabled: $('#alertEnabled').checked,
+      channels: { email: $('#alertEmailOn').checked, webhook: $('#alertWebhookOn').checked },
+      email: {
+        host: $('#alertSmtpHost').value.trim(),
+        port: Number($('#alertSmtpPort').value) || 465,
+        user: $('#alertSmtpUser').value.trim(),
+        // 空 = 保持不变；勾了清除 = ''；否则用输入的
+        pass: passClear ? '' : (passTyped ? passTyped : '__KEEP__'),
+        from: $('#alertSmtpFrom').value.trim(),
+        to: $('#alertSmtpTo').value,
+        secure: $('#alertSmtpSecure').checked,
+        allowPlaintextAuth: $('#alertSmtpPlain').checked,
+      },
+      webhook: { url: $('#alertHookUrl').value.trim(), type: $('#alertHookType').value },
+      minCreditsPerKey: Number($('#alertMinCredits').value) || 0,
+      minUsableKeys: Number($('#alertMinUsable').value) || 0,
+      windowPctWarn: Number($('#alertWinWarn').value) || 85,
+      windowPctCritical: Number($('#alertWinCrit').value) || 95,
+      creditsFetchFailWarn: Number($('#alertFetchFail').value) || 2,
+      windowMs: (Number($('#alertWindowSec').value) || 300) * 1000,
+      minSamples: Number($('#alertMinSamples').value) || 8,
+      failureRateWarn: Number($('#alertRateWarn').value) || 30,
+      failureRateCritical: Number($('#alertRateCrit').value) || 60,
+      consecutiveFailuresCritical: Number($('#alertConsecutive').value) || 5,
+      quotaFaultsCritical: Number($('#alertQuotaFaults').value) || 3,
+      stallsWarn: Number($('#alertStalls').value) || 3,
+      inflightWarn: Number($('#alertInflight').value) || 5,
+      cooldownMs: (Number($('#alertCooldownMin').value) || 0) * 60000,
+      maxSendsPerHour: Number($('#alertMaxHour').value) || 20,
+      repeatWhenStuck: $('#alertRepeat').checked,
+      notifyRecovery: $('#alertRecovery').checked,
+    };
+  }
+
+  $('#alertEmailOn').addEventListener('change', syncAlertChannelBoxes);
+  $('#alertWebhookOn').addEventListener('change', syncAlertChannelBoxes);
+
+  $('#alertForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.submitter || $('#alertForm button[type="submit"]');
+    btn.disabled = true;
+    try {
+      const res = await api('/admin/api/alerts', { method: 'PUT', body: JSON.stringify(alertFormPatch()) });
+      state.alerts = res;
+      fillAlerts(res);
+      renderAlerts();
+      if (res.warnings?.length) toast('已保存，但：' + res.warnings.join('；'), 'err');
+      else toast('告警设置已保存');
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $('#btnAlertTest').addEventListener('click', async () => {
+    const btn = $('#btnAlertTest');
+    btn.disabled = true;
+    btn.classList.add('loading');
+    try {
+      // 先把当前表单存下来再测，避免"改了没保存就点测试"的困惑
+      const saved = await api('/admin/api/alerts', { method: 'PUT', body: JSON.stringify(alertFormPatch()) });
+      state.alerts = saved;
+      fillAlerts(saved);
+      renderAlerts();
+      if (saved.warnings?.length) {
+        toast('配置有问题：' + saved.warnings.join('；'), 'err');
+        return;
+      }
+      const res = await api('/admin/api/alerts/test', { method: 'POST', body: JSON.stringify({}) });
+      state.alerts = res.stats || state.alerts;
+      fillAlerts(state.alerts);
+      renderAlerts();
+      if (res.ok) toast('测试通知已发出，请查收');
+      else {
+        const errs = Object.entries(res.results || {})
+          .map(([ch, r]) => `${ch}: ${r.ok ? 'ok' : r.error}`).join('；');
+        toast('发送失败 — ' + (errs || res.error || '未知原因'), 'err');
+      }
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('loading');
+    }
+  });
+
+  $('#btnAlertCheck').addEventListener('click', async () => {
+    const btn = $('#btnAlertCheck');
+    btn.disabled = true;
+    btn.classList.add('loading');
+    try {
+      const res = await api('/admin/api/alerts/check', { method: 'POST', body: JSON.stringify({}) });
+      state.alerts = res;
+      fillAlerts(res);
+      renderAlerts();
+      const n = (res.active || []).length;
+      toast(n ? `体检完成：${n} 条告警未恢复` : '体检完成：一切正常');
+    } catch (err) {
+      toast(err.message, 'err');
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove('loading');
+    }
+  });
+
+  $('#btnAlertClear').addEventListener('click', async () => {
+    const ok = await askConfirm(
+      '重置告警状态',
+      '将清空「未恢复」标记，让每条告警都能重新发一次（告警历史保留）。<br>通常只在改完阈值想立刻复测时用。',
+      '重置',
+    );
+    if (!ok) return;
+    try {
+      const res = await api('/admin/api/alerts/clear', { method: 'POST', body: JSON.stringify({}) });
+      toast(`已重置 ${res.cleared || 0} 条告警状态`);
+      await refreshAlerts();
+    } catch (err) {
+      toast(err.message, 'err');
+    }
+  });
 
   /* ── 调度设置（模式 / 失败阈值 / 额度轮询） ─────────── */
   const MODE_HINT = {
@@ -831,6 +1099,8 @@
       $('#apiBase').title = data.apiBase || 'api';
       renderAll();
       renderSessions();
+      if (state.tab === 'alerts') await refreshAlerts();
+      else refreshAlertsSilent();
       $('#lastSync').textContent = `数据同步于 ${fmtClock(Date.now())}`;
     } catch (e) {
       state.loading = false;
@@ -1010,6 +1280,11 @@
     // 停在会话页时自动刷新（只查会话，不动额度）
     if (state.tab === 'sessions' && Date.now() - lastSessionFetch > 15000) {
       refreshSessions();
+    }
+    // 停在告警页时自动刷新（未恢复告警数、窗口失败率）
+    if (state.tab === 'alerts' && Date.now() - lastAlertFetch > 15000) {
+      refreshAlertsSilent();
+      renderAlerts();
     }
   }, 1000);
 

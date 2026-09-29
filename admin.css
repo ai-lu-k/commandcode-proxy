@@ -1331,6 +1331,91 @@ input:disabled { opacity: 0.6; }
   .brand-text { display: none; }
 }
 
+/* ══ 告警页 ══════════════════════════════════════════════ */
+.alert-channels { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.alert-group {
+  display: grid;
+  gap: 10px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--bg-soft) 40%, transparent);
+}
+.alert-group-title {
+  margin: 0;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+.alert-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.alert-actions .btn { flex: 1 1 auto; }
+.sw.sm { padding: 7px 9px; }
+.sw.sm .sw-text b { font-size: 12px; }
+.alert-status {
+  display: grid;
+  gap: 8px;
+  padding: 12px 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-size: 12px;
+}
+.alert-status .ps-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+}
+.alert-status .ps-row b {
+  color: var(--ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  word-break: break-word;
+}
+.alert-status .tone-ok { color: var(--ok, #37b26c); }
+.alert-status .tone-warn { color: var(--warn, #d99a1f); }
+.alert-status .tone-crit { color: var(--danger, #e5484d); }
+
+.alert-active, .alert-history { display: grid; gap: 10px; padding: 16px 18px; }
+.alert-history h3 { margin-top: 4px; }
+.alert-item {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--muted);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+.alert-item.crit { border-left-color: var(--danger, #e5484d); }
+.alert-item.warn { border-left-color: var(--warn, #d99a1f); }
+.alert-item.rec { border-left-color: var(--ok, #37b26c); }
+.alert-tag {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  padding: 2px 7px;
+  border-radius: var(--r-full, 999px);
+  background: var(--bg-soft);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+}
+.alert-item.crit .alert-tag { color: var(--danger, #e5484d); }
+.alert-item.warn .alert-tag { color: var(--warn, #d99a1f); }
+.alert-item.rec .alert-tag { color: var(--ok, #37b26c); }
+.alert-body { display: grid; gap: 3px; min-width: 0; }
+.alert-body b { font-size: 13px; }
+.alert-body span { font-size: 12px; color: var(--muted); word-break: break-word; }
+.alert-body small { font-size: 11px; color: var(--faint); }
+
+@media (max-width: 720px) {
+  .alert-channels { grid-template-columns: 1fr; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

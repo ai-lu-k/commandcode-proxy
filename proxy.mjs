@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync, writeFileSync, renameSync, mkdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createAlerts, defaultStatePath, normalizeAlerts } from './alerts.mjs';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -32,6 +33,8 @@ function loadConfig() {
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app） // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
+    adminUrl: '',                 // 告警邮件里附的管理台地址，如 https://ai.lu-k.cn/proxy/
+    hostLabel: '',                // 告警邮件里的主机标识（留空用容器/机器主机名）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -58,6 +61,8 @@ function loadConfig() {
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
+  if (process.env.CC_ADMIN_URL) defaults.adminUrl = process.env.CC_ADMIN_URL;
+  if (process.env.CC_HOST_LABEL) defaults.hostLabel = process.env.CC_HOST_LABEL;
 
   return defaults;
 }
@@ -120,6 +125,8 @@ function normalizeSettings(raw) {
   s.creditsRefreshMs = Math.max(0, Math.min(24 * 3600 * 1000, Number(s.creditsRefreshMs) || 0));
   s.autoDisableExhausted = s.autoDisableExhausted !== false;
   s.onAllExhausted = s.onAllExhausted === 'best-effort' ? 'best-effort' : 'error';
+  // 告警配置（余额/失败率阈值 + 邮件/webhook 通道）随 Key 池一起持久化到 keys.json
+  s.alerts = normalizeAlerts(raw?.alerts);
   return s;
 }
 
@@ -153,7 +160,7 @@ function loadKeyStore() {
   } catch {
     keyStore = {
       lb: { ...LB_DEFAULTS },
-      settings: { ...SETTINGS_DEFAULTS },
+      settings: normalizeSettings(),
       keys: [],
       defaultId: null,
     };
@@ -286,7 +293,7 @@ function markKeySuccess(pick) {
 /**
  * 记录一次上游失败。
  * trigger: quota-exhausted（额度/限流）| disabled（凭证失效）| forbidden（403，可能是套餐/权限）
- *          | any-error（5xx/网络等）
+ *          | upstream-capacity（上游供应商容量不足，不惩罚 Key）| any-error（5xx/网络等）
  * 会话模式下，普通错误要连续失败达到 failThreshold 才弃用该 Key；
  * 额度类错误立即冷却（并按设置自动停用）；403 只换 Key，不惩罚该 Key。
  */
@@ -303,6 +310,9 @@ function markKeyFailure(pick, status, retryable, trigger = 'any-error', bodyText
     saveKeyStore();
     return;
   }
+
+  // 额度/凭证类失败是「余额告警」的实时信号（401/402/429 往往先于额度轮询发生）
+  try { alerts?.noteUpstreamFailure({ trigger, keyId: k.id, label: k.label, status }); } catch {}
 
   k.consecutiveFailures = (k.consecutiveFailures || 0) + 1;
 
@@ -417,6 +427,8 @@ function setAutoDisabled(k, reason, until = null) {
     keyId: k.id, label: k.label, reason,
     until: until ? new Date(until).toISOString() : null,
   });
+  // 余额用尽 / 凭证失效：立刻告警，不等下一轮额度轮询（轮询间隔可能 15 分钟）
+  try { alerts?.noteKeyDisabled({ keyId: k.id, label: k.label, reason, until }); } catch {}
 }
 
 /** 清掉已到期的自动停用标记 */
@@ -591,10 +603,28 @@ function pickBestEffort(abandoned) {
   return { apiKey: target.key, id: target.id, label: target.label, bestEffort: true };
 }
 
+/**
+ * 上游「供应商容量不足」判定。
+ * CC 在模型被套餐锁定到单一供应商、且该供应商满载时会返回 429/503，文案形如：
+ *   "The request limited providers for this model and they are currently at capacity.
+ *    Add more providers or remove restrictions for automatic fallback. Providers considered: deepseek."
+ * 这类错误的成因在上游路由，Key 本身完全健康 —— 绝不能被当成「额度用尽」而停用，
+ * 否则一次上游抖动就能把整个池子清空。
+ */
+function isUpstreamCapacityError(status, bodyText) {
+  if (status !== 429 && status !== 503) return false;
+  return /limited providers|(?:currently\s+)?at capacity|providers considered|no available (?:capacity|providers)/i
+    .test(String(bodyText || ''));
+}
+
 /** 上游失败归类，决定是"立即换"还是"再试几次" */
 function classifyFailure(status, bodyText) {
   const text = String(bodyText || '');
   if (status === 401) return 'disabled';
+  // 429/402 有两种语义，必须分开处理：
+  //   · 供应商容量不足（上游路由问题）→ upstream-capacity：只换 Key / 重试，不惩罚 Key
+  //   · 真·额度用尽 / 限流           → quota-exhausted：冷却是对的
+  if (isUpstreamCapacityError(status, text)) return 'upstream-capacity';
   if (status === 402 || status === 429) return 'quota-exhausted';
   // 403：可能是 Key 无权限，也可能是"套餐不含该模型"这类请求级限制。
   // 后者不该惩罚 Key（否则一次请求就能把整个池冷却掉），所以单独归类，只换 Key 不冷却。
@@ -658,6 +688,10 @@ function hasAnyUsableKey() {
 function poolUnavailableResponse() {
   const now = Date.now();
   const total = keyStore.keys.length;
+  // 池不可用 = 请求立刻失败，属于最严重的一类告警（收到就说明线上已经在报错）
+  try {
+    alerts?.notePoolUnavailable({ total, usable: keyStore.keys.filter((k) => isKeyUsable(k)).length });
+  } catch {}
   if (!total) {
     return { status: 401, body: { error: { message: 'Key 池为空，请先在管理页 http://<host>:<port>/ 配置至少一个 user_* Key', type: 'auth_error' } } };
   }
@@ -898,12 +932,17 @@ let consecutiveTimeouts = 0;
 const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
+// 告警引擎在下面（额度轮询之后）才创建；log() 可能更早被调用，所以这里用可空引用。
+let alerts = null;
+
 function log(level, msg, data) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
   console.log(line);
   if (CFG.logFile) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
+  // 上游「已返回 200 但流中途出问题」这类故障只有日志里有，抓给告警引擎统计
+  try { alerts?.noteLog(level, msg, data); } catch {}
 }
 
 log('info', 'Key pool loaded', {
@@ -4258,6 +4297,8 @@ async function refreshAllCredits() {
     creditsRefresh.lastAt = Date.now();
     creditsRefresh.lastDurationMs = creditsRefresh.lastAt - t0;
     log('info', 'Credits refreshed', { ok, failed, durationMs: creditsRefresh.lastDurationMs });
+    // 额度数据刷新后立刻体检余额类告警（低余额、窗口将满、可用 Key 不足）
+    try { await alerts?.evaluateCredits(); } catch (e) { log('warn', 'Alert credits eval failed', { message: e.message }); }
   } finally {
     creditsRefresh.running = false;
   }
@@ -4288,6 +4329,26 @@ function scheduleCreditsRefresh() {
   creditsRefresh.nextAt = Date.now() + ms;
   log('info', 'Credits auto-refresh scheduled', { intervalMs: ms });
 }
+
+// ── 告警引擎 ────────────────────────────────────────
+// 余额不足 / 请求失败过多 时发邮件（或 webhook）。
+// 配置存在 keys.json 的 settings.alerts 里（跟着数据卷走，重建容器不丢），
+// 也可用环境变量覆写（CC_ALERT_SMTP_* / CC_ALERT_TO / CC_ALERT_WEBHOOK / CC_ALERT_ENABLED）。
+const ALERTS_STATE_PATH = process.env.CC_ALERT_STATE_FILE
+  ? resolve(process.env.CC_ALERT_STATE_FILE)
+  : defaultStatePath(KEYS_PATH);
+
+alerts = createAlerts({
+  log,
+  getKeys: () => keyStore.keys,
+  isUsable: (k) => isKeyUsable(k),
+  getCreditsRefresh: () => creditsRefresh,
+  getConfig: () => keyStore.settings.alerts || {},
+  setConfig: (cfg) => { keyStore.settings.alerts = normalizeAlerts(cfg); saveKeyStore(); },
+  statePath: ALERTS_STATE_PATH,
+  adminUrl: process.env.CC_ADMIN_URL || CFG.adminUrl || '',
+  host: process.env.CC_HOST_LABEL || CFG.hostLabel || undefined,
+});
 
 async function readJsonOr400(req, res) {
   try {
@@ -4343,21 +4404,67 @@ async function handleAdminApi(req, res, url) {
     }
   }
 
+  if (path === '/alerts') {
+    if (req.method === 'GET') return sendJSON(res, 200, alerts.stats());
+    if (req.method === 'PUT') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      const { warnings, rearmed } = alerts.saveConfig(body);
+      log('info', 'Alert settings updated from admin', {
+        enabled: !!body.enabled,
+        email: !!(body.email && body.email.host),
+        webhook: !!(body.webhook && body.webhook.url),
+        warnings: warnings.length ? warnings : undefined,
+      });
+      // 通道刚配好（log-only → 可用）时立刻体检一轮，把当前真实存在的问题发出去
+      if (rearmed) alerts.checkNow().catch(() => {});
+      return sendJSON(res, 200, { ...alerts.stats(), warnings, rearmed });
+    }
+  }
+
+  // 通道自检：不走去重/限速，直接把当前配置发一条测试告警
+  if (path === '/alerts/test' && req.method === 'POST') {
+    const body = await readJsonOr400(req, res);
+    if (body === null) return;
+    const result = await alerts.test({ channel: body?.channel || 'all' });
+    return sendJSON(res, 200, { ...result, stats: alerts.stats() });
+  }
+
+  // 手动立刻体检一次（不等轮询/窗口）
+  if (path === '/alerts/check' && req.method === 'POST') {
+    return sendJSON(res, 200, await alerts.checkNow());
+  }
+
+  // 清空当前告警状态（?history=1 连历史一起清）
+  if (path === '/alerts/clear' && req.method === 'POST') {
+    return sendJSON(res, 200, alerts.clear({ history: url.searchParams.get('history') === '1' }));
+  }
+
   if (path === '/settings') {
     if (req.method === 'GET') {
-      return sendJSON(res, 200, { settings: keyStore.settings, creditsRefresh: creditsRefreshState() });
+      // alerts 里的 SMTP 密码不回传（masked 后 pass 恒为空）
+      return sendJSON(res, 200, {
+        settings: { ...keyStore.settings, alerts: alerts.maskedConfig() },
+        creditsRefresh: creditsRefreshState(),
+      });
     }
     if (req.method === 'PUT') {
       const body = await readJsonOr400(req, res);
       if (!body) return;
       const before = keyStore.settings.creditsRefreshMs;
-      keyStore.settings = normalizeSettings({ ...keyStore.settings, ...body });
+      // 告警配置有独立接口（/admin/api/alerts）：这里把 alerts 摘掉，
+      // 免得管理台回传的脱敏值（pass 为空）把真实密码冲掉
+      const { alerts: _ignoredAlerts, ...rest } = body;
+      keyStore.settings = normalizeSettings({ ...keyStore.settings, ...rest });
       saveKeyStore();
       if (keyStore.settings.creditsRefreshMs !== before) scheduleCreditsRefresh();
       // 设置变化后立刻重算自动停用状态（例如刚打开/关闭"额度用尽自动停用"）
       for (const k of keyStore.keys) syncAutoDisable(k);
       saveKeyStore();
-      return sendJSON(res, 200, { settings: keyStore.settings, creditsRefresh: creditsRefreshState() });
+      return sendJSON(res, 200, {
+        settings: { ...keyStore.settings, alerts: alerts.maskedConfig() },
+        creditsRefresh: creditsRefreshState(),
+      });
     }
   }
 
@@ -4386,7 +4493,7 @@ async function handleAdminApi(req, res, url) {
       return sendJSON(res, 200, {
         apiBase: CFG.apiBase,
         lb: currentLbConfig(),
-        settings: keyStore.settings,
+        settings: { ...keyStore.settings, alerts: alerts.maskedConfig() },
         creditsRefresh: creditsRefreshState(),
         serverTime: Date.now(),
         defaultId: keyStore.defaultId,
@@ -4480,6 +4587,19 @@ const server = http.createServer(async (req, res) => {
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
 
+  // 生成类请求的成功/失败样本 → 告警引擎的失败率统计。
+  // 只认最终 HTTP 状态码：客户端主动断连（不触发 finish）不计入，避免把用户取消算成失败。
+  if (alerts && (url.pathname === '/v1/chat/completions'
+    || url.pathname === '/v1/messages'
+    || url.pathname === '/v1/responses')) {
+    const t0 = Date.now();
+    res.once('finish', () => {
+      try {
+        alerts.noteRequestOutcome({ status: res.statusCode, path: url.pathname, durationMs: Date.now() - t0 });
+      } catch {}
+    });
+  }
+
   // 在途上限准入。/health 与管理 UI 例外：探活与编排器不该因业务繁忙而收 503。
   const isLiveness = url.pathname === '/health'
     || url.pathname === '/'
@@ -4554,6 +4674,7 @@ process.on('unhandledRejection', (reason) => {
 // 启动时按已持久化的额度数据同步一次自动停用状态，并开启额度轮询
 for (const k of keyStore.keys) syncAutoDisable(k);
 scheduleCreditsRefresh();
+alerts.start();
 if (keyStore.settings.creditsRefreshMs > 0) {
   // 启动后先拉一次，让管理页与调度尽快拿到真实额度
   setTimeout(() => { refreshAllCredits().catch(() => {}); }, 3000).unref?.();
@@ -4595,6 +4716,21 @@ server.listen(CFG.port, CFG.host, () => {
     idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
     maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
     upstreamProxy: redactProxyUrl(UPSTREAM_PROXY),
+    alerts: (() => {
+      const c = alerts.config();
+      const emailOn = c.channels.email && c.email.host && c.email.to.length;
+      const hookOn = c.channels.webhook && c.webhook.url;
+      if (!c.enabled) return 'off (enabled=false)';
+      if (!emailOn && !hookOn) return 'log-only（未配置 SMTP/webhook，仅写日志与历史）';
+      return [
+        emailOn ? `email → ${c.email.to.join(', ')} via ${c.email.host}:${c.email.port}` : null,
+        hookOn ? `webhook (${c.webhook.type})` : null,
+      ].filter(Boolean).join(' + ');
+    })(),
+    alertsThresholds: (() => {
+      const c = alerts.config();
+      return `余额 < ${c.minCreditsPerKey} / 窗口 ≥ ${c.windowPctWarn}% / 失败率 ≥ ${c.failureRateWarn}%（${Math.round(c.windowMs / 1000)}s 窗口）`;
+    })(),
   });
   if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
     log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });

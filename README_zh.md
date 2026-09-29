@@ -95,6 +95,13 @@ commandcode/
 | `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限 `503`，见[在途上限](#在途请求上限可选) |
 | `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数就断开该客户端，见[僵死连接](#僵死连接既不读也不断开) |
 | `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | 后端 keep-alive 时长（`headersTimeout` 自动 +1s）。**必须大于反代侧的 keepalive_timeout**，见 [keep-alive 时序](#nginx-反代建议) |
+| `CC_ADMIN_URL` | 空 | 告警邮件里附的管理台地址（如 `https://example.com/proxy/`）|
+| `CC_HOST_LABEL` | 空（用主机名）| 告警邮件里的主机标识 |
+| `CC_ALERT_STATE_FILE` | 与 `keys.json` 同目录的 `alerts-state.json` | 告警去重状态/历史落盘位置 |
+| `CC_ALERT_ENABLED` | `true` | 告警总开关（`false` 只记录不发送）|
+| `CC_ALERT_SMTP_HOST` / `_PORT` / `_SECURE` / `_USER` / `_PASS` / `_FROM` | 空 | SMTP 配置（默认端口 465 隐式 TLS；也可在管理台页面填）|
+| `CC_ALERT_TO` | 空 | 收件人，逗号分隔；会与页面里配置的收件人合并 |
+| `CC_ALERT_WEBHOOK` / `CC_ALERT_WEBHOOK_TYPE` | 空 | webhook 地址与格式，见[告警](#告警余额--失败率预警) |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -104,7 +111,60 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 > ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
 
+### 告警（余额 / 失败率预警）
+
+管理台「告警」页配置，检测到**余额不足**或**失败过多**就发邮件（可选 webhook）。
+配置随 Key 池一起存在 `keys.json`（`settings.alerts`），重建容器不丢；密码不回传给前端。
+
+| 告警 | 触发条件（默认值）| 级别 |
+|------|------------------|------|
+| 余额偏低 | 单 Key 剩余额度 < `minCreditsPerKey`（5）| 警告 |
+| 余额/额度已用尽 | 剩余 ≤ 0，或任一窗口用量 ≥ `windowPctCritical`（95%），或被自动停用 | 严重 |
+| 限额窗口将满 | 任一窗口用量 ≥ `windowPctWarn`（85%）| 警告 |
+| 凭证失效 | 上游 401，Key 被自动停用 | 严重 |
+| 额度查询失败 | 该 Key 的额度接口报错 | 警告 |
+| 可用 Key 不足 | 可用数 < `minUsableKeys`（2）；0 个 → 严重 | 警告 |
+| 池内无可用 Key | 请求已经开始报错（`poolUnavailableResponse`）| 严重（即时）|
+| 请求失败率 | 窗口 `windowMs`（5min）内样本 ≥ `minSamples`（8）时，失败率 ≥ `failureRateWarn`（30%）→ 警告，≥ `failureRateCritical`（60%）→ 严重 | 警告/严重 |
+| 连续失败 | 连续失败 ≥ `consecutiveFailuresCritical`（5）| 严重 |
+| 上游额度/凭证类失败 | 窗口内 401/402/429 类失败 ≥ `quotaFaultsCritical`（3）| 严重 |
+| 上游卡顿/截断 | 窗口内空闲超时、流截断 ≥ `stallsWarn`（3）| 警告 |
+| 并发超限被拒 | 窗口内 `CC_MAX_INFLIGHT` 拒绝 ≥ `inflightWarn`（5）| 警告 |
+
+行为约定：
+
+- **不刷屏**：同一条告警在恢复之前只发一次；`warn → critical` 升级会立刻补发；
+  `repeatWhenStuck` 打开后才按 `cooldownMs` 反复提醒。恢复时补一封「已恢复」（`notifyRecovery`）。
+- **防邮件风暴**：每小时最多 `maxSendsPerHour`（20）封，超出的只记历史。
+- **不丢事件**：没配 SMTP / webhook 时走 log-only —— 告警仍然写日志（`[alert] …`）和历史，管理台看得到。
+- **状态落盘**：`alerts-state.json` 与 `keys.json` 同目录，进程重启不会把同一条告警再发一遍。
+
+邮件通道（零依赖，内置 SMTP 客户端，不装 nodemailer）：
+
+- `465` = 隐式 TLS；`587/25` 走 STARTTLS。服务器**不支持 STARTTLS 时拒绝在明文里发密码**
+  （本机/内网中继可通过 `email.allowPlaintextAuth` 显式打开）。
+- QQ / 163 等邮箱的「密码」填**授权码**；中文主题按 RFC 2047 编码，不会乱码。
+- 想先验证而不动真邮箱：`node tools/fake-smtp.mjs` 起一个假 SMTP，把管理台里的
+  SMTP 指到 `127.0.0.1:2525`（关掉隐式 TLS、打开允许明文认证），点「发送测试」，终端会打印收到的邮件。
+
+Webhook 通道按地址自动识别格式：企业微信机器人、Bark、Server酱、PushPlus，其余发通用 JSON：
+
+```json
+{ "source": "commandcode-proxy", "level": "critical", "title": "…", "text": "…", "at": 1790000000000 }
+```
+
+管理台 API：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/admin/api/alerts` | 配置（脱敏）+ 未恢复告警 + 窗口统计 + 历史 |
+| `PUT` | `/admin/api/alerts` | 保存配置；`email.pass` 缺省或 `__KEEP__` = 不改密码 |
+| `POST` | `/admin/api/alerts/test` | 立即发一条测试通知（不走去重/限速）|
+| `POST` | `/admin/api/alerts/check` | 立刻体检一次（不等轮询窗口）|
+| `POST` | `/admin/api/alerts/clear` | 清空「未恢复」标记；`?history=1` 连历史一起清 |
+
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
+
 
 让代理**发往 Command Code 的请求**走本地 HTTP 代理 —— 用于出口地区调整，或排查风控 `403` 时做 IP 维度对照。
 

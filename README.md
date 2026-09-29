@@ -106,6 +106,31 @@ authority for actual retention and provider availability.
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
 
+### Alerts (low balance / high failure rate)
+
+Configured on the **告警 (Alerts)** tab of the admin UI — see `README_zh.md` → 「告警（余额 / 失败率预警）」
+for the full threshold table. The proxy emails you when a key's remaining credits fall below a
+threshold, when a quota window fills up, when a key gets auto-disabled (exhausted or 401), when the
+usable-key count gets too low, or when the request failure rate / consecutive failures / upstream
+stalls / in-flight rejections exceed thresholds. An optional webhook channel (WeCom bot / Bark /
+ServerChan / PushPlus / generic JSON) can be enabled alongside email.
+
+- One notification per incident until it recovers (a recovery mail is sent too), capped at
+  `maxSendsPerHour` to avoid mail storms. With no channel configured it is log-only
+  (`[alert] …` lines plus history) — events are never silently dropped.
+- Dedup state and history live in `alerts-state.json` next to `keys.json`, so a restart does not
+  re-send the same alert.
+- Dependency-free SMTP client: implicit TLS on 465, STARTTLS otherwise; it refuses to send
+  credentials over plaintext unless `email.allowPlaintextAuth` is set (local relays only).
+- `node tools/fake-smtp.mjs` starts a throwaway SMTP server so you can test the channel without a
+  real mailbox.
+
+Env overrides: `CC_ALERT_ENABLED`, `CC_ALERT_SMTP_HOST/_PORT/_SECURE/_USER/_PASS/_FROM`,
+`CC_ALERT_TO`, `CC_ALERT_WEBHOOK`, `CC_ALERT_WEBHOOK_TYPE`, `CC_ADMIN_URL`, `CC_HOST_LABEL`,
+`CC_ALERT_STATE_FILE`.
+
+Admin API: `GET|PUT /admin/api/alerts`, `POST /admin/api/alerts/test|check|clear`.
+
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
 Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.

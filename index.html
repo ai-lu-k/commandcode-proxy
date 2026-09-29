@@ -140,6 +140,12 @@
         <span>会话</span>
         <b class="tab-count" id="tabSessionsCount">0</b>
       </button>
+      <button class="tab" type="button" role="tab" data-tab="alerts"
+        id="tabBtnAlerts" aria-selected="false" aria-controls="panel-alerts" tabindex="-1">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-alert"/></svg>
+        <span>告警</span>
+        <b class="tab-count" id="tabAlertsCount" hidden>0</b>
+      </button>
     </nav>
 
     <main class="main">
@@ -389,6 +395,247 @@
           </div>
           <div id="sessionList" class="session-list"></div>
         </section>
+      </section>
+
+      <!-- ══ 标签页 4：告警 ════════════════════════════════════ -->
+      <section class="tab-panel" id="panel-alerts" data-panel="alerts" role="tabpanel" aria-labelledby="tabBtnAlerts" hidden>
+        <div class="grid-panels">
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title">
+                <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-alert"/></svg></span>
+                <div>
+                  <h2>预警通知</h2>
+                  <p class="hint">余额不足或失败率过高时发邮件（可选 webhook）。没配通道时只写日志，不丢事件。</p>
+                </div>
+              </div>
+            </div>
+
+            <form id="alertForm" class="form">
+              <label class="sw">
+                <input type="checkbox" id="alertEnabled" />
+                <span class="track" aria-hidden="true"></span>
+                <span class="sw-text"><b>开启告警</b><small>关闭后仍会记录告警历史，但不发送</small></span>
+              </label>
+
+              <div class="alert-channels">
+                <label class="sw">
+                  <input type="checkbox" id="alertEmailOn" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>邮件</b><small>SMTP 直发，无需第三方服务</small></span>
+                </label>
+                <label class="sw">
+                  <input type="checkbox" id="alertWebhookOn" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>Webhook</b><small>企业微信 / Bark / Server酱 / 通用 JSON</small></span>
+                </label>
+              </div>
+
+              <div class="alert-group" id="alertEmailBox">
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">SMTP 服务器</span>
+                    <input id="alertSmtpHost" type="text" placeholder="smtp.qq.com" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">端口</span>
+                    <input id="alertSmtpPort" type="number" min="1" max="65535" placeholder="465" />
+                    <span class="field-hint">465 = 隐式 TLS，587/25 走 STARTTLS</span>
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">账号</span>
+                    <input id="alertSmtpUser" type="text" placeholder="you@qq.com" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <div class="field" id="alertPassField">
+                    <span class="field-label">密码 / 授权码</span>
+                    <input id="alertSmtpPass" type="password" placeholder="留空 = 不修改" autocomplete="new-password" />
+                    <span class="field-hint" id="alertPassHint">—</span>
+                    <label class="sw sm">
+                      <input type="checkbox" id="alertPassClear" />
+                      <span class="track" aria-hidden="true"></span>
+                      <span class="sw-text"><b>清除已保存的密码</b></span>
+                    </label>
+                  </div>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">发件人</span>
+                    <input id="alertSmtpFrom" type="text" placeholder="留空 = 用账号" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">收件人</span>
+                    <input id="alertSmtpTo" type="text" placeholder="多个用逗号分隔" autocomplete="off" spellcheck="false" />
+                  </label>
+                </div>
+                <label class="sw">
+                  <input type="checkbox" id="alertSmtpSecure" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>隐式 TLS（465）</b><small>关掉则使用 STARTTLS；只对本机中继开放明文密码</small></span>
+                </label>
+                <label class="sw">
+                  <input type="checkbox" id="alertSmtpPlain" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>允许明文认证</b><small>仅在服务器不支持 STARTTLS 且是本机/内网中继时才打开</small></span>
+                </label>
+              </div>
+
+              <div class="alert-group" id="alertHookBox">
+                <label class="field">
+                  <span class="field-label">Webhook 地址</span>
+                  <input id="alertHookUrl" type="text" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…" autocomplete="off" spellcheck="false" />
+                </label>
+                <label class="field">
+                  <span class="field-label">格式</span>
+                  <span class="select-wrap block">
+                    <select id="alertHookType">
+                      <option value="auto">自动识别</option>
+                      <option value="wecom">企业微信机器人</option>
+                      <option value="bark">Bark</option>
+                      <option value="serverchan">Server酱</option>
+                      <option value="pushplus">PushPlus</option>
+                      <option value="generic">通用 JSON</option>
+                    </select>
+                  </span>
+                </label>
+              </div>
+
+              <div class="alert-group">
+                <h3 class="alert-group-title">余额阈值</h3>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">单 Key 余额低于</span>
+                    <input id="alertMinCredits" type="number" min="0" step="0.5" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">可用 Key 少于</span>
+                    <input id="alertMinUsable" type="number" min="0" max="1000" />
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">窗口用量 ≥ (%) 警告</span>
+                    <input id="alertWinWarn" type="number" min="1" max="100" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">窗口用量 ≥ (%) 严重</span>
+                    <input id="alertWinCrit" type="number" min="1" max="100" />
+                  </label>
+                </div>
+                <label class="field">
+                  <span class="field-label">额度轮询失败 Key 数 ≥</span>
+                  <input id="alertFetchFail" type="number" min="1" max="1000" />
+                  <span class="field-hint">额度接口本身查不动时也提醒（否则自动停用判断会失灵）</span>
+                </label>
+              </div>
+
+              <div class="alert-group">
+                <h3 class="alert-group-title">失败阈值</h3>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">统计窗口 (秒)</span>
+                    <input id="alertWindowSec" type="number" min="30" max="86400" step="30" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">最少样本数</span>
+                    <input id="alertMinSamples" type="number" min="1" max="100000" />
+                    <span class="field-hint">样本太少不评估失败率，避免偶发一次就报警</span>
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">失败率 ≥ (%) 警告</span>
+                    <input id="alertRateWarn" type="number" min="1" max="100" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">失败率 ≥ (%) 严重</span>
+                    <input id="alertRateCrit" type="number" min="1" max="100" />
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">连续失败 ≥ 严重</span>
+                    <input id="alertConsecutive" type="number" min="1" max="10000" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">额度类失败 ≥ 严重</span>
+                    <input id="alertQuotaFaults" type="number" min="1" max="10000" />
+                  </label>
+                </div>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">卡顿/截断 ≥ 警告</span>
+                    <input id="alertStalls" type="number" min="1" max="10000" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">并发超限 ≥ 警告</span>
+                    <input id="alertInflight" type="number" min="1" max="10000" />
+                  </label>
+                </div>
+              </div>
+
+              <div class="alert-group">
+                <h3 class="alert-group-title">抑制与投递</h3>
+                <div class="grid-2">
+                  <label class="field">
+                    <span class="field-label">同类告警最小间隔 (分钟)</span>
+                    <input id="alertCooldownMin" type="number" min="0" max="1440" step="5" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">每小时最多发送</span>
+                    <input id="alertMaxHour" type="number" min="1" max="500" />
+                  </label>
+                </div>
+                <label class="sw">
+                  <input type="checkbox" id="alertRepeat" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>未恢复时反复提醒</b><small>默认只在新增/升级/恢复时各发一封</small></span>
+                </label>
+                <label class="sw">
+                  <input type="checkbox" id="alertRecovery" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>恢复时补发通知</b><small>「已恢复」邮件，一封告警有始有终</small></span>
+                </label>
+              </div>
+
+              <div class="alert-actions">
+                <button class="btn primary" type="submit">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-check-circle"/></svg>
+                  <span class="btn-label">保存告警设置</span>
+                </button>
+                <button class="btn ghost" type="button" id="btnAlertTest">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-share"/></svg>
+                  <span class="btn-label">发送测试</span>
+                </button>
+                <button class="btn ghost" type="button" id="btnAlertCheck">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                  <span class="btn-label">立即体检</span>
+                </button>
+                <button class="btn ghost" type="button" id="btnAlertClear" title="清空当前告警状态，让每条告警都能重新发一次">
+                  <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x"/></svg>
+                  <span class="btn-label">重置状态</span>
+                </button>
+              </div>
+
+              <div class="alert-status" id="alertStatus"></div>
+            </form>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <div class="panel-title">
+                <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-inbox"/></svg></span>
+                <div>
+                  <h2>当前告警与历史</h2>
+                  <p class="hint">未恢复的告警只发一次；下面能看到每条告警的发送状态。</p>
+                </div>
+              </div>
+            </div>
+            <div id="alertActive" class="alert-active"></div>
+            <div id="alertHistory" class="alert-history"></div>
+          </section>
+        </div>
       </section>
 
     </main>
