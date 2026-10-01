@@ -10,3 +10,24 @@ captured-requests/
 keys.json
 # docker compose 挂载出来的数据目录（里面有真实 Key，绝不能提交）
 data/
+
+# ── 本机私有：含活凭据的排查脚本 / 截图 / 草稿，绝不入库 ──
+LOCAL-NOTES.md
+seo/
+newapi-patch/
+*.bak-*
+/home-*.png
+/header-icon.png
+/newapi-home-*.png
+tools/probe_*.ps1
+tools/_recon_*.sh
+tools/ttft_*.py
+tools/ttft_*.mjs
+tools/rate_probe.py
+tools/_configure_jev.py
+tools/_deploy_jev.sh
+tools/_move_block.mjs
+tools/_parse_alerts.py
+tools/_check_ch12.sh
+tools/_clean_stale_abilities.sh
+
