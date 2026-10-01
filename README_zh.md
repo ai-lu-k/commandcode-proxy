@@ -163,6 +163,39 @@ Webhook 通道按地址自动识别格式：企业微信机器人、Bark、Serve
 | `POST` | `/admin/api/alerts/check` | 立刻体检一次（不等轮询窗口）|
 | `POST` | `/admin/api/alerts/clear` | 清空「未恢复」标记；`?history=1` 连历史一起清 |
 
+### 订阅到期优先（`expiryFirst`）
+
+管理台「调度与容错」页的开关（默认**关**，落盘在 `keys.json` 的 `lb.expiryFirst`）。
+
+Command Code 订阅一到期，剩余额度就作废，所以这个开关让调度**优先把最快到期的 Key 用掉**：
+把 Key 按订阅到期时间排序，先空闲、再最快到期，选第一个。
+
+| 场景 | 行为 |
+|------|------|
+| 空闲 Key 中有最快到期的 | 选它 |
+| 最快到期的 Key 正在被使用 | 让位给**下一个**最快到期的空闲 Key |
+| 全部都在用 | 仍然按到期时间选（不排队、不拒绝） |
+| 额度数据里没有订阅信息 | 排到最后（拿不到到期时间的不抢优先级） |
+
+约定：
+
+- **「有人在用」的定义**：该 Key 上有**在途请求**，或最近 `settings.expiryBusyMs`（默认 5 分钟，
+  管理台可改，设为 0 = 只看在途请求）内有会话活动。正在跑的会话不会被抢走。
+- **开启后覆盖 `strategy`**：`strategy`（加权轮询/随机/粘性…）只在开关关闭时生效。
+- **会话粘性仍然优先**：已经绑定到某个 Key 的会话继续用它；到期排序只影响新会话与重绑。
+- 到期时间来自上游 `/alpha/billing/subscriptions`（已取消看 `cancelAt`，否则看 `currentPeriodEnd`），
+  由额度轮询（`creditsRefreshMs`）一并刷新。
+
+管理台与 API：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET`/`PUT` | `/admin/api/lb` | `expiryFirst` 开关（PUT 只写传入字段）|
+| `GET` | `/admin/api/keys` | 每个 Key 带 `expiresAt` 与 `credits.subscription`（`planId`/`status`/`willRenew`/`expiresAt`）|
+
+> 到期时间只用于**排序与显示**：订阅过期不会自动停用 Key —— 真停用仍由额度/失败检测决定，
+> 避免把「刚续费但数据还没刷新」的 Key 误杀。
+
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
 

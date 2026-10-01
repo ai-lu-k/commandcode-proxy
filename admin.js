@@ -250,7 +250,11 @@
         <strong>${fmtNum(c.creditsRemaining)}</strong>
         <small>${c.plan ? escapeHtml(c.plan) : '已同步'} · ${fmtAgo(c.fetchedAt)}</small>`;
     }
-    return `<div class="kc-gauge">${ringHtml(k)}<div class="kc-cred">${body}</div></div>`;
+    const sub = subInfo(k);
+    const subLine = sub
+      ? `<small class="kc-sub" title="订阅${sub.willRenew ? '（自动续费）' : ''} · ${fmtTime(sub.at)}">订阅${sub.willRenew ? '续费' : '到期'} ${fmtCountdown(sub.at)}</small>`
+      : '';
+    return `<div class="kc-gauge">${ringHtml(k)}<div class="kc-cred">${body}${subLine}</div></div>`;
   }
 
   function windowsBlock(k) {
@@ -268,6 +272,37 @@
         <div class="win-foot"><span>${fmtNum(w.used)} / ${fmtNum(w.cap)}</span>${resets}</div>
       </div>`;
     }).join('')}</div>`;
+  }
+
+  /** 订阅到期信息：到期时间 + 剩余时间 + 套餐 */
+  function subInfo(k) {
+    const s = k?.credits?.subscription || null;
+    const at = Number(s?.expiresAt ?? k?.expiresAt) || null;
+    if (!at) return null;
+    return {
+      at,
+      left: at - serverNow(),
+      plan: s?.planId || k?.credits?.plan || null,
+      status: s?.status || null,
+      willRenew: !!s?.willRenew,
+    };
+  }
+
+  /** 订阅到期徽标：已过期 / 3 天内到期 / 正常 */
+  function subscriptionBadge(k) {
+    const s = subInfo(k);
+    if (!s) return '';
+    const exp = s.left <= 0;
+    const soon = !exp && s.left <= 3 * 24 * 3600 * 1000;
+    const cls = exp ? 'danger' : soon ? 'warn' : '';
+    const label = exp ? '订阅已过期' : `订阅 ${fmtCountdown(s.at)}过期`;
+    const title = [
+      s.plan ? `套餐 ${s.plan}` : null,
+      s.status ? `状态 ${s.status}` : null,
+      `${exp ? '已结束' : '到期'} ${fmtTime(s.at)}`,
+      s.willRenew ? '当前为自动续费' : '不会自动续费',
+    ].filter(Boolean).join(' · ');
+    return `<span class="badge ${cls}" title="${escapeHtml(title)}">${icon('clock')}${escapeHtml(label)}</span>`;
   }
 
   /** 自动停用徽标（额度用尽等），带恢复时间 */
@@ -309,6 +344,7 @@
           <h4 title="${escapeHtml(k.label)}">${escapeHtml(k.label)}</h4>
           ${k.isDefault ? `<span class="badge star">${icon('star-fill')}默认</span>` : ''}
           ${k.enabled ? '' : `<span class="badge off">停用</span>`}
+          ${subscriptionBadge(k)}
           ${autoDisabledBadge(k)}
           ${k.cooling ? `<span class="badge warn" title="冷却至 ${fmtTime(k.cooldownUntil)}">${icon('clock')}冷却中</span>` : ''}
           ${k.consecutiveFailures ? `<span class="badge danger" title="连续失败 ${k.consecutiveFailures} 次，达到阈值后会换 Key">${icon('alert')}连败 ${k.consecutiveFailures}</span>` : ''}
@@ -474,8 +510,17 @@
     $('#lbStickyBy').value = lb.stickyBy || 'client-key';
     $('#lbMaxRetries').value = lb.maxRetries ?? 2;
     $('#lbCooldownMs').value = lb.cooldownMs ?? 60000;
+    $('#lbExpiryFirst').checked = !!lb.expiryFirst;
     $('#stickyByWrap').style.display = lb.strategy === 'sticky' ? '' : 'none';
+    syncExpiryInputs();
     updateStrategyHint();
+  }
+
+  /** 「订阅到期优先」打开时才允许填在途判定窗口 */
+  function syncExpiryInputs() {
+    const on = $('#lbExpiryFirst').checked;
+    $('#expiryBusyWrap').style.opacity = on ? '1' : '0.5';
+    $('#expiryBusySec').disabled = !on;
   }
 
   function updateStrategyHint() {
@@ -848,6 +893,8 @@
     state.creditsRefresh = credits || state.creditsRefresh;
     setMode(state.settings.mode);
     $('#failThreshold').value = state.settings.failThreshold ?? 3;
+    $('#expiryBusySec').value = Math.round((Number(state.settings.expiryBusyMs) || 0) / 1000);
+    syncExpiryInputs();
 
     const iv = Number(state.settings.creditsRefreshMs) || 0;
     const preset = $('#pollPreset');
@@ -982,6 +1029,14 @@
     }
 
     const worst = clampPct(c.worstPct);
+    const sub = c.subscription || null;
+    const subRow = sub && sub.expiresAt
+      ? `<div class="row"><span>订阅${sub.willRenew ? '续费' : '到期'}</span><b title="${escapeHtml([
+        sub.planId ? `套餐 ${sub.planId}` : '',
+        sub.status ? `状态 ${sub.status}` : '',
+        sub.willRenew ? '自动续费' : '不自动续费',
+      ].filter(Boolean).join(' · '))}">${fmtTime(sub.expiresAt)}（${sub.expiresAt - serverNow() > 0 ? fmtCountdown(sub.expiresAt) + '后' : '已过期'}）</b></div>`
+      : '';
     const wins = (c.windows || []).map((w) => {
       const pct = clampPct(w.pct);
       const resets = w.resetsAt ? `<span class="sep">·</span><span>重置 ${fmtCountdown(w.resetsAt)}</span>` : '';
@@ -1017,6 +1072,7 @@
       </div>
 
       <div class="wins">${wins || `<p class="empty sm"><span>无窗口限额数据</span></p>`}</div>
+      ${subRow ? `<div class="cred-extra">${subRow}</div>` : ''}
     `;
   }
 
@@ -1197,6 +1253,23 @@
     setMode(btn.dataset.mode, { save: true });
   });
 
+  // 订阅到期优先：开关本身即时保存（和分配模式一致），不用点保存按钮。
+  // 这里只写 expiryFirst —— 判定窗口由表单里的输入框负责，别把没填的值冲成 0。
+  $('#lbExpiryFirst').addEventListener('change', async () => {
+    syncExpiryInputs();
+    const on = $('#lbExpiryFirst').checked;
+    try {
+      const saved = await api('/admin/api/lb', { method: 'PUT', body: JSON.stringify({ expiryFirst: on }) });
+      if (saved) state.lb = { ...state.lb, ...saved };
+      toast(on ? '已开启：优先用订阅最快过期的空闲 Key' : '已关闭订阅到期优先');
+    } catch (err) {
+      toast(err.message, 'err');
+      $('#lbExpiryFirst').checked = !on;
+      syncExpiryInputs();
+      await reload({ silent: true });
+    }
+  });
+
   $('#lbForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = e.submitter || $('#lbForm button[type="submit"]');
@@ -1209,12 +1282,14 @@
           stickyBy: $('#lbStickyBy').value,
           maxRetries: Number($('#lbMaxRetries').value) || 0,
           cooldownMs: Number($('#lbCooldownMs').value) || 0,
+          expiryFirst: $('#lbExpiryFirst').checked,
         }),
       });
       if (saved) state.lb = saved;
       await saveSettings({
         mode: $('#modeSwitch .seg.is-active')?.dataset.mode || 'session',
         failThreshold: Number($('#failThreshold').value) || 3,
+        expiryBusyMs: Math.max(0, Math.min(3600, Number($('#expiryBusySec').value) || 0)) * 1000,
       }, '调度设置已保存');
     } catch (err) {
       toast(err.message, 'err');

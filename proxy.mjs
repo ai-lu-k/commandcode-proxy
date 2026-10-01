@@ -91,6 +91,9 @@ const LB_DEFAULTS = {
   stickyBy: 'client-key',        // none | ip | client-key
   maxRetries: 2,                 // 可重试失败时最多再换几个 key
   cooldownMs: 60000,             // 失败后暂时跳过
+  // 订阅到期优先：优先用「订阅最快到期」的 Key（快过期的额度先用掉），
+  // 正在被使用的 Key 让位给下一个最快到期的空闲 Key。开启后覆盖 strategy。
+  expiryFirst: false,
 };
 
 // 调度设置（中转站场景）：会话粘性 + 失败/额度触发转移 + 额度轮询
@@ -99,6 +102,7 @@ const SETTINGS_DEFAULTS = {
   failThreshold: 3,              // 同一会话在同一 Key 上连续失败几次后换 Key
   sessionTtlMs: 6 * 60 * 60 * 1000, // 会话绑定有效期（超时回收）
   creditsRefreshMs: 15 * 60 * 1000, // 服务端定时刷新额度间隔（默认 15 分钟），0 = 关闭
+  expiryBusyMs: 5 * 60 * 1000,   // 到期优先用：Key 上有在途请求，或最近这么久内有会话活动，就算「有人在用」
   autoDisableExhausted: true,    // 额度用尽自动停用（额度恢复后自动恢复）
   onAllExhausted: 'error',       // 池内全部不可用时：error（明确报错）| best-effort（仍然尝试）
   // 决策模型（typesafe/jev）：不是 chat 模型，只有 Provider API 的 /provider/v1/systemone，
@@ -135,6 +139,11 @@ function normalizeSettings(raw) {
   s.failThreshold = Math.max(1, Math.min(20, Number(s.failThreshold) || SETTINGS_DEFAULTS.failThreshold));
   s.sessionTtlMs = Math.max(60000, Math.min(7 * 24 * 3600 * 1000, Number(s.sessionTtlMs) || SETTINGS_DEFAULTS.sessionTtlMs));
   s.creditsRefreshMs = Math.max(0, Math.min(24 * 3600 * 1000, Number(s.creditsRefreshMs) || 0));
+  // 显式 0 是合法值（只看在途请求），undefined 才回落到默认
+  const busyRaw = Number(s.expiryBusyMs);
+  s.expiryBusyMs = Number.isFinite(busyRaw)
+    ? Math.max(0, Math.min(3600 * 1000, busyRaw))
+    : SETTINGS_DEFAULTS.expiryBusyMs;
   s.autoDisableExhausted = s.autoDisableExhausted !== false;
   s.onAllExhausted = s.onAllExhausted === 'best-effort' ? 'best-effort' : 'error';
   // 告警配置（余额/失败率阈值 + 邮件/webhook 通道）随 Key 池一起持久化到 keys.json
@@ -152,6 +161,7 @@ function loadKeyStore() {
   try {
     const raw = JSON.parse(readFileSync(KEYS_PATH, 'utf-8'));
     keyStore.lb = { ...LB_DEFAULTS, ...(raw?.lb || {}) };
+    keyStore.lb.expiryFirst = keyStore.lb.expiryFirst === true;
     keyStore.settings = normalizeSettings(raw?.settings);
     keyStore.keys = (raw?.keys || []).filter((k) => k?.key).map((k) => ({
       id: k.id || newKeyId(),
@@ -239,6 +249,8 @@ function stickyValue(req, clientKey) {
 
 function pickByStrategy(candidates, req, clientKey) {
   if (!candidates.length) return null;
+  // 订阅到期优先开启时直接按到期时间排序，覆盖下面的所有策略
+  if (keyStore.lb.expiryFirst) return rankByExpiry(candidates)[0];
   const strategy = keyStore.lb.strategy || 'weighted';
 
   if (strategy === 'sticky') {
@@ -551,9 +563,61 @@ function activeSessionCounts(now = Date.now()) {
   return counts;
 }
 
-/** 分散选 Key：活跃会话最少 → 默认 Key 优先 → 最久未用 → 权重最大 */
+// ══════════════════════════════════════════════════════════
+// 订阅到期优先（lb.expiryFirst）
+// CC 订阅到期后额度就作废，所以「最快到期的先用掉」；但正在被使用的 Key
+// 不该再压请求 —— 让位给下一个最快到期的**空闲** Key。
+// ══════════════════════════════════════════════════════════
+
+/** 每个 Key 当前在途请求数（判断「有人在用」的一部分） */
+const keyInflight = new Map(); // keyId → 在途请求数
+
+function keyInflightEnter(id) {
+  if (!id) return;
+  keyInflight.set(id, (keyInflight.get(id) || 0) + 1);
+}
+
+function keyInflightLeave(id) {
+  if (!id) return;
+  const n = (keyInflight.get(id) || 0) - 1;
+  if (n > 0) keyInflight.set(id, n); else keyInflight.delete(id);
+}
+
+/** 订阅到期时间（毫秒）；没有额度数据 / 查不到订阅的 Key 排到最后 */
+function keyExpiryAt(k) {
+  const c = k?.credits;
+  if (!c || c.error) return Infinity;
+  const t = Number(c.expiresAt);
+  return Number.isFinite(t) && t > 0 ? t : Infinity;
+}
+
+/** 当前「有人在用」的 Key：有在途请求，或最近 expiryBusyMs 内有会话活动 */
+function busyKeyIds(now = Date.now()) {
+  const busy = new Set();
+  for (const [id, n] of keyInflight) if (n > 0) busy.add(id);
+  const win = Math.max(0, Number(keyStore.settings.expiryBusyMs) || 0);
+  for (const rec of sessionRoutes.values()) {
+    if (win > 0 && now - (rec.lastAt || 0) <= win) busy.add(rec.keyId);
+  }
+  return busy;
+}
+
+/** 到期优先排序：空闲 Key 优先 → 最快到期优先 → 最久未用 → 权重高 → id 稳定兜底 */
+function rankByExpiry(pool, now = Date.now()) {
+  const busy = busyKeyIds(now);
+  return [...pool].sort((a, b) =>
+    Number(busy.has(a.id)) - Number(busy.has(b.id))
+    || keyExpiryAt(a) - keyExpiryAt(b)
+    || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
+    || (b.weight || 0) - (a.weight || 0)
+    || String(a.id).localeCompare(String(b.id)));
+}
+
+/** 分散选 Key：到期优先 → 活跃会话最少 → 默认 Key 优先 → 最久未用 → 权重最大 */
 function pickBySpreading(pool, now) {
   if (!pool.length) return null;
+  // 订阅到期优先：先挑最快到期且空闲的 Key（已有会话仍按粘性走，不会被抢走）
+  if (keyStore.lb.expiryFirst) return rankByExpiry(pool, now)[0];
   const counts = activeSessionCounts(now);
   return [...pool].sort((a, b) =>
     (counts.get(a.id) || 0) - (counts.get(b.id) || 0)
@@ -2017,6 +2081,7 @@ async function forwardToCCWithFailover(body, clientKey, req, signal, promptCache
     lastPick = pick;
 
     let failure = null; // { mapped, retryable, trigger }
+    keyInflightEnter(pick.id); // 「有人在用」判定：在途请求期间该 Key 视为忙
     try {
       await ensureInitialized(pick.apiKey, signal);
       const response = await forwardToCC(body, pick.apiKey, req.headers, signal, promptCacheKey);
@@ -2048,6 +2113,8 @@ async function forwardToCCWithFailover(body, clientKey, req, signal, promptCache
       markKeyFailure(pick, 0, true, 'any-error');
       recordSessionFailure(sessionId, 'any-error');
       failure = { mapped: mapCcError(502, e.message), retryable: true, trigger: 'any-error' };
+    } finally {
+      keyInflightLeave(pick.id);
     }
 
     lastMapped = failure.mapped;
@@ -4434,7 +4501,9 @@ function publicKeyView(k) {
     cooling,
     isDefault: k.id === keyStore.defaultId,
     credits: k.credits,
+    expiresAt: k.credits?.expiresAt ?? null,
     activeSessions: activeSessionCounts().get(k.id) || 0,
+    inflight: keyInflight.get(k.id) || 0,
   };
 }
 
@@ -4492,7 +4561,43 @@ async function ccGet(path, key, orgId) {
   return r.json();
 }
 
+/**
+ * CC 订阅字段 → 统一的到期信息（全部转成毫秒）。
+ * 上游 /alpha/billing/subscriptions 的 data 形状：
+ *   { id, status, planId, cancelAtPeriodEnd, currentPeriodStart, currentPeriodEnd,
+ *     cancelAt, canceledAt, endedAt, ... }
+ * 到期时间取 cancelAt（已取消）→ currentPeriodEnd（正常周期结束/自动续费日）。
+ */
+function parseSubscription(sub) {
+  const ms = (v) => {
+    if (v === null || v === undefined || v === '') return null;
+    const t = typeof v === 'number' ? v : Date.parse(v);
+    return Number.isFinite(t) && t > 0 ? t : null;
+  };
+  const status = sub.status ? String(sub.status) : null;
+  const currentPeriodEnd = ms(sub.currentPeriodEnd);
+  const cancelAt = ms(sub.cancelAt);
+  const canceledAt = ms(sub.canceledAt);
+  const endedAt = ms(sub.endedAt);
+  const willRenew = !endedAt && !cancelAt && !canceledAt && sub.cancelAtPeriodEnd !== true
+    && (status === null || status === 'active' || status === 'trialing');
+  return {
+    planId: sub.planId ? String(sub.planId) : null,
+    status,
+    createdAt: ms(sub.createdAt),
+    currentPeriodStart: ms(sub.currentPeriodStart),
+    currentPeriodEnd,
+    cancelAt,
+    canceledAt,
+    endedAt,
+    willRenew,
+    /** 订阅结束（或自动续费）时间：调度排序与「还有多久过期」都用它 */
+    expiresAt: endedAt || cancelAt || currentPeriodEnd || null,
+  };
+}
+
 // credits.{monthlyCredits,purchasedCredits,freeCredits} + windowLimits.{fiveHour,weekly}
+// 外加订阅信息（plan + 到期时间），管理台靠它显示「还有多久过期」
 async function fetchCreditsForKey(k) {
   const fetchedAt = Date.now();
   let orgId = null;
@@ -4504,7 +4609,14 @@ async function fetchCreditsForKey(k) {
   if (root?.error) return { error: String(root.error), fetchedAt };
 
   let plan = null;
-  try { plan = (await ccGet('/alpha/billing/subscriptions', k.key, orgId)).data?.planId || null; } catch {}
+  let subscription = null;
+  try {
+    const data = (await ccGet('/alpha/billing/subscriptions', k.key, orgId))?.data;
+    if (data && typeof data === 'object') {
+      subscription = parseSubscription(data);
+      plan = subscription.planId;
+    }
+  } catch {}
 
   const ledger = root.credits || {};
   const num = (v) => Number(v) || 0;
@@ -4531,6 +4643,8 @@ async function fetchCreditsForKey(k) {
   return {
     fetchedAt, plan, credits,
     creditsRemaining: credits.remaining,
+    subscription,
+    expiresAt: subscription?.expiresAt ?? null,
     windows,
     worstPct: windows.reduce((m, w) => Math.max(m, w.pct), 0),
   };
@@ -4662,6 +4776,7 @@ function currentLbConfig() {
     stickyBy: keyStore.lb.stickyBy,
     maxRetries: keyStore.lb.maxRetries,
     cooldownMs: keyStore.lb.cooldownMs,
+    expiryFirst: keyStore.lb.expiryFirst === true,
   };
 }
 
@@ -4673,6 +4788,8 @@ async function handleAdminApi(req, res, url) {
     if (req.method === 'PUT') {
       const body = await readJsonOr400(req, res);
       if (!body) return;
+      // 布尔开关单独处理，别被下面的 Number() 吃掉
+      if (body.expiryFirst !== undefined) keyStore.lb.expiryFirst = !!body.expiryFirst;
       for (const f of LB_FIELDS) {
         if (body[f] === undefined) continue;
         if (f === 'strategy' || f === 'stickyBy') keyStore.lb[f] = String(body[f]);

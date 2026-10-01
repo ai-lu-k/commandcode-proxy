@@ -131,6 +131,28 @@ Env overrides: `CC_ALERT_ENABLED`, `CC_ALERT_SMTP_HOST/_PORT/_SECURE/_USER/_PASS
 
 Admin API: `GET|PUT /admin/api/alerts`, `POST /admin/api/alerts/test|check|clear`.
 
+### Subscription expiry first (`expiryFirst`)
+
+A switch on the admin UI **调度与容错 (Scheduling)** tab (off by default, persisted as
+`lb.expiryFirst` in `keys.json`; see `README_zh.md` → 「订阅到期优先」 for the full table).
+
+A Command Code subscription's unused quota is lost when the subscription ends, so this switch makes
+the pool spend the **soonest-expiring key first**: keys are ordered by subscription expiry (idle
+keys first, then soonest expiry) and the first one wins.
+
+- **"In use" means** the key has an in-flight request, or saw session activity within
+  `settings.expiryBusyMs` (default 5 minutes, editable in the UI; `0` = in-flight requests only).
+  A key that is being used steps aside for the *next* soonest-expiring idle key.
+- **Overrides `strategy`** while enabled; session stickiness still wins for already-bound sessions.
+- Expiry comes from the upstream `/alpha/billing/subscriptions` call the credit poll already makes
+  (`cancelAt` when cancelled, otherwise `currentPeriodEnd`) and is refreshed on the
+  `creditsRefreshMs` interval.
+- Expiry is used for **ordering and display only** — an expired subscription never auto-disables a
+  key by itself, so a just-renewed key whose data has not refreshed yet is not killed by mistake.
+
+Admin API: `GET|PUT /admin/api/lb` (`expiryFirst`); `GET /admin/api/keys` returns `expiresAt` and
+`credits.subscription` (`planId` / `status` / `willRenew` / `expiresAt`) per key.
+
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
 Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.

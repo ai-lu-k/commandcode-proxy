@@ -761,6 +761,23 @@ kbd {
   line-height: 1.2;
 }
 .kc-cred small { font-size: 10.5px; color: var(--faint); }
+/* 订阅到期的一行（卡片内额外信息） */
+.kc-cred small.kc-sub { color: var(--muted); }
+/* 额度明细里的附加信息（订阅到期等） */
+.cred-extra { margin-top: 10px; display: grid; gap: 6px; }
+.cred-extra .row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.cred-extra .row b {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
 
 .kc-wins { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 9px 18px; min-width: 0; }
 .win { display: grid; gap: 5px; min-width: 0; }

@@ -8,6 +8,8 @@ stdout.txt
 stderr.txt
 captured-requests/
 keys.json
+# 运行期状态（告警去重/历史），不进仓库
+alerts-state.json
 # docker compose 挂载出来的数据目录（里面有真实 Key，绝不能提交）
 data/
 
@@ -24,10 +26,8 @@ tools/_recon_*.sh
 tools/ttft_*.py
 tools/ttft_*.mjs
 tools/rate_probe.py
-tools/_configure_jev.py
-tools/_deploy_jev.sh
-tools/_move_block.mjs
-tools/_parse_alerts.py
-tools/_check_ch12.sh
-tools/_clean_stale_abilities.sh
+# 一次性排查/运维脚本统一用下划线前缀，自动忽略
+tools/_*.sh
+tools/_*.py
+tools/_*.mjs
 

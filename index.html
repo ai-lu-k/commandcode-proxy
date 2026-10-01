@@ -264,6 +264,18 @@
                 <span class="field-hint">额度/限流类错误会立即换 Key，不等这个次数。</span>
               </label>
 
+              <label class="sw">
+                <input type="checkbox" id="lbExpiryFirst" />
+                <span class="track" aria-hidden="true"></span>
+                <span class="sw-text"><b>订阅到期优先</b><small>优先用订阅最快过期的 Key；正在被使用的 Key 让位给下一个最快到期的空闲 Key</small></span>
+              </label>
+
+              <label class="field" id="expiryBusyWrap">
+                <span class="field-label">「有人在用」判定窗口（秒）</span>
+                <input id="expiryBusySec" type="number" min="0" max="3600" step="10" />
+                <span class="field-hint">该 Key 有在途请求，或最近这段时间内有会话活动，就算「有人在用」。0 = 只看在途请求。</span>
+              </label>
+
               <div id="legacyLb" class="legacy-lb hidden">
                 <label class="field">
                   <span class="field-label">旧策略（每次请求模式）</span>
@@ -309,7 +321,7 @@
                 <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-check-circle"/></svg>
                 <span class="btn-label">保存调度设置</span>
               </button>
-              <p class="hint foot-hint">会话粘性：一个会话固定一个 Key，新会话自动落到最空闲的 Key；Key 额度用尽或连续失败后，会话自动换到下一个可用 Key。</p>
+              <p class="hint foot-hint">会话粘性：一个会话固定一个 Key，新会话自动落到最空闲的 Key；Key 额度用尽或连续失败后，会话自动换到下一个可用 Key。打开「订阅到期优先」后，新会话改为优先落到订阅最快到期且空闲的 Key。</p>
             </form>
           </section>
 
