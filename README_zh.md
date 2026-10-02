@@ -182,7 +182,7 @@ Command Code 订阅一到期，剩余额度就作废，所以这个开关让调�
 - **「有人在用」的定义**：该 Key 上有**在途请求**，或最近 `settings.expiryBusyMs`（默认 5 分钟，
   管理台可改，设为 0 = 只看在途请求）内有会话活动。正在跑的会话不会被抢走。
 - **开启后覆盖 `strategy`**：`strategy`（加权轮询/随机/粘性…）只在开关关闭时生效。
-- **会话粘性仍然优先**：已经绑定到某个 Key 的会话继续用它；到期排序只影响新会话与重绑。
+- **显式指定的东西仍然优先**：默认 Key（`defaultId`）与已有会话的绑定不会被抢走。
 - 到期时间来自上游 `/alpha/billing/subscriptions`（已取消看 `cancelAt`，否则看 `currentPeriodEnd`），
   由额度轮询（`creditsRefreshMs`）一并刷新。
 

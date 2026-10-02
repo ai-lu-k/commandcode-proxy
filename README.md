@@ -143,7 +143,8 @@ keys first, then soonest expiry) and the first one wins.
 - **"In use" means** the key has an in-flight request, or saw session activity within
   `settings.expiryBusyMs` (default 5 minutes, editable in the UI; `0` = in-flight requests only).
   A key that is being used steps aside for the *next* soonest-expiring idle key.
-- **Overrides `strategy`** while enabled; session stickiness still wins for already-bound sessions.
+- **Overrides `strategy`** while enabled; an explicitly pinned `defaultId` and already-bound
+  sessions still win, so expiry ordering only affects new sessions and rebinds.
 - Expiry comes from the upstream `/alpha/billing/subscriptions` call the credit poll already makes
   (`cancelAt` when cancelled, otherwise `currentPeriodEnd`) and is refreshed on the
   `creditsRefreshMs` interval.
