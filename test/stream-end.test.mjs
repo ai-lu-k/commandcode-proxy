@@ -202,3 +202,70 @@ test('#38 回归：tool-calls 仍报 tool_use / tool_calls', async () => {
     assert.equal(a.json.stop_reason, 'tool_use');
   } finally { await s.close(); }
 });
+
+// ── ⑤ 还没吐出任何内容就断了：代理自己再请求一次 ──────────
+// 客户端此时一个字节都没收到（流式也没发响应头），重试不会造成重复输出。
+
+/** 只发了开场事件就断开，没有任何内容、也没有 finish */
+const PREAMBLE_ONLY = ['{"type":"start"}', '{"type":"start-step"}'];
+
+/** 第一次 /alpha/generate 回 lines 后断开，之后的请求走 mock 的默认正常响应 */
+function failFirstGenerate(lines) {
+  let failed = false;
+  return (req, res) => {
+    if (req.url !== '/alpha/generate' || failed) return;
+    failed = true;
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    for (const line of lines) res.write(line + '\n');
+    res.end();
+  };
+}
+
+async function openaiStream(s, body = CHAT) {
+  const r = await s.proxy.post('/v1/chat/completions', { ...body, stream: true }, AUTH);
+  return { status: r.status, text: await r.text() };
+}
+
+test('chat 非流式：没出内容就断 → 自动再请求一次，客户端拿到完整回答', async () => {
+  const s = await setup({ onRequest: failFirstGenerate(PREAMBLE_ONLY) });
+  try {
+    const { status, json } = await openaiNonStream(s);
+    assert.equal(status, 200);
+    assert.equal(json.choices[0].message.content, 'hello');
+    assert.equal(s.mock.generateCount(), 2);
+    assert.match(s.proxy.logs(), /Upstream stream incomplete, retrying/);
+  } finally { await s.close(); }
+});
+
+test('chat 流式：没出内容就断 → 自动再请求一次，客户端只看到第二次的完整流', async () => {
+  const s = await setup({ onRequest: failFirstGenerate(PREAMBLE_ONLY) });
+  try {
+    const { status, text } = await openaiStream(s);
+    assert.equal(status, 200);
+    assert.match(text, /"content":"hello"/);
+    assert.match(text, /data: \[DONE\]/);
+    assert.doesNotMatch(text, /upstream_error/);
+    assert.equal(s.mock.generateCount(), 2);
+  } finally { await s.close(); }
+});
+
+test('chat 流式：已经吐出内容再断 → 不重试，如实报错', async () => {
+  const s = await setup({ onRequest: failFirstGenerate(NO_FINISH) });
+  try {
+    const { status, text } = await openaiStream(s);
+    assert.equal(status, 200, '内容已经发出，响应头早已是 200');
+    assert.match(text, /partial/);
+    assert.match(text, /no finish event/);
+    assert.equal(s.mock.generateCount(), 1, '再请求一次会让客户端看到重复内容');
+  } finally { await s.close(); }
+});
+
+test('CC_INCOMPLETE_RETRIES=0 关闭重试，回到原来的 502', async () => {
+  const s = await setup({ onRequest: failFirstGenerate(PREAMBLE_ONLY), env: { CC_INCOMPLETE_RETRIES: '0' } });
+  try {
+    const { status, json } = await openaiNonStream(s);
+    assert.equal(status, 502);
+    assert.match(json.error.message, /no finish event/);
+    assert.equal(s.mock.generateCount(), 1);
+  } finally { await s.close(); }
+});
