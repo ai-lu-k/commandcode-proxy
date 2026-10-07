@@ -143,21 +143,6 @@
   const levelOf = (pct) => (pct >= 80 ? 'danger' : pct >= 50 ? 'warn' : 'ok');
   const WIN_NAMES = { '5h': '5 小时窗口', weekly: '本周窗口' };
 
-  const STRATEGY_LABEL = {
-    weighted: '加权轮询', 'round-robin': '轮询', 'weighted-random': '加权随机',
-    random: '随机', sticky: '粘性会话', 'least-recent': '最久未用', failover: '主备故障转移',
-  };
-  const STRATEGY_HINT = {
-    weighted: '按权重轮询分发，权重越高被选中的次数越多。',
-    'round-robin': '所有 Key 依次轮流使用，忽略权重差异。',
-    'weighted-random': '按权重随机抽取，权重越高命中概率越大。',
-    random: '在可用 Key 中完全随机选择。',
-    sticky: '同一客户端标识（或 IP）固定命中同一个 Key。',
-    'least-recent': '优先使用最久没有被用到过的 Key。',
-    failover: '按优先级主备切换，前面的 Key 不可用才轮到后面的。',
-  };
-  const strategyLabel = (v) => STRATEGY_LABEL[v] || v || '—';
-
   /* ── 状态 ────────────────────────────────────────────── */
   const state = {
     keys: [],
@@ -171,6 +156,7 @@
     },
     creditsRefresh: null,
     sessions: [],
+    poolOrder: [],
     alerts: null,
     serverSkew: 0,
     tab: 'keys',
@@ -195,12 +181,24 @@
   }
 
   const SORTERS = {
-    default: (a, b) => (Number(b.isDefault) - Number(a.isDefault)) || ((a.createdAt || 0) - (b.createdAt || 0)),
+    // 「池内选取顺序」直接用服务端算好的 poolOrder（真空闲 → 相对空闲 → priority → 到期 …）
+    default: (a, b) => (poolRank(a.id) - poolRank(b.id)) || ((a.createdAt || 0) - (b.createdAt || 0)),
     'credits-desc': (a, b) => (b.credits?.creditsRemaining ?? -1) - (a.credits?.creditsRemaining ?? -1),
     'usage-desc': (a, b) => (b.credits?.worstPct ?? -1) - (a.credits?.worstPct ?? -1),
     'weight-desc': (a, b) => (b.weight ?? 0) - (a.weight ?? 0),
     'label-asc': (a, b) => String(a.label ?? '').localeCompare(String(b.label ?? ''), 'zh-Hans-CN'),
   };
+
+  /** 在服务端 poolOrder 里的位次；不在里面（不可用）的排到最后 */
+  function poolRank(id) {
+    const i = (state.poolOrder || []).findIndex((x) => x.id === id);
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+  }
+
+  /** 某个 Key 在选取顺序里的负载信息（用于卡片提示） */
+  function poolInfo(id) {
+    return (state.poolOrder || []).find((x) => x.id === id) || null;
+  }
 
   function visibleKeys() {
     const list = state.keys.filter(matchesFilter);
@@ -322,6 +320,18 @@
     return true;
   }
 
+  /** 池内选取位次徽标：第 1 位是「首选」，其余显示位次与当前负载 */
+  function poolRankBadge(k) {
+    const info = poolInfo(k.id);
+    if (!info) return '';
+    const rank = poolRank(k.id) + 1;
+    const load = info.idle ? '真空闲' : `在途 ${info.inflight} · 会话 ${info.sessions}`;
+    const title = `池内选择位次 #${rank}（${load}；优先级 ${info.priority}）`;
+    return rank === 1
+      ? `<span class="badge star" title="${escapeHtml(title)}">${icon('star-fill')}首选</span>`
+      : `<span class="badge" title="${escapeHtml(title)}">#${rank} ${escapeHtml(load)}</span>`;
+  }
+
   function keyCard(k, index) {
     const busy = state.busy.has(k.id);
     const cls = [
@@ -342,7 +352,7 @@
         <div class="kc-title">
           <span class="kc-index">${pad(index + 1)}</span>
           <h4 title="${escapeHtml(k.label)}">${escapeHtml(k.label)}</h4>
-          ${k.isDefault ? `<span class="badge star">${icon('star-fill')}默认</span>` : ''}
+          ${poolRankBadge(k)}
           ${k.enabled ? '' : `<span class="badge off">停用</span>`}
           ${subscriptionBadge(k)}
           ${autoDisabledBadge(k)}
@@ -361,9 +371,6 @@
       </div>
 
       <div class="kc-actions">
-        <button type="button" class="icon-btn ${k.isDefault ? 'tone-default' : ''}" data-act="default"
-          title="${k.isDefault ? '取消默认 Key' : '设为默认 Key'}"
-          aria-label="${k.isDefault ? '取消默认 Key' : '设为默认 Key'}">${icon(k.isDefault ? 'star-fill' : 'star')}</button>
         <button type="button" class="icon-btn" data-act="credits" title="查询该 Key 额度" aria-label="查询该 Key 额度">${icon('refresh')}</button>
         <button type="button" class="icon-btn" data-act="edit" title="编辑" aria-label="编辑">${icon('pencil')}</button>
         <button type="button" class="icon-btn tone-danger" data-act="del" title="删除" aria-label="删除">${icon('trash')}</button>
@@ -506,26 +513,8 @@
   function fillLb(lb) {
     if (!lb) return;
     state.lb = lb;
-    $('#lbStrategy').value = lb.strategy || 'weighted';
-    $('#lbStickyBy').value = lb.stickyBy || 'client-key';
     $('#lbMaxRetries').value = lb.maxRetries ?? 2;
     $('#lbCooldownMs').value = lb.cooldownMs ?? 60000;
-    $('#lbExpiryFirst').checked = !!lb.expiryFirst;
-    $('#stickyByWrap').style.display = lb.strategy === 'sticky' ? '' : 'none';
-    syncExpiryInputs();
-    updateStrategyHint();
-  }
-
-  /** 「订阅到期优先」打开时才允许填在途判定窗口 */
-  function syncExpiryInputs() {
-    const on = $('#lbExpiryFirst').checked;
-    $('#expiryBusyWrap').style.opacity = on ? '1' : '0.5';
-    $('#expiryBusySec').disabled = !on;
-  }
-
-  function updateStrategyHint() {
-    const v = $('#lbStrategy').value;
-    if (STRATEGY_HINT[v]) $('#lbStrategyHint').textContent = STRATEGY_HINT[v];
   }
 
   /* ── 标签页 ──────────────────────────────────────────── */
@@ -875,7 +864,7 @@
   /* ── 调度设置（模式 / 失败阈值 / 额度轮询） ─────────── */
   const MODE_HINT = {
     session: '一个会话固定一个 Key：多开 agent 会话会自动分散到不同 Key，某个 Key 额度用尽或连续失败后，该会话自动换到下一个可用 Key。',
-    request: '每次请求都按策略重新选 Key（旧行为），适合无会话概念的简单转发。',
+    request: '每次请求都按同一套顺序重新选 Key（真空闲 → 相对空闲 → priority → 到期），适合无会话概念的简单转发。',
   };
 
   function setMode(mode, { save = false } = {}) {
@@ -883,7 +872,6 @@
     state.settings.mode = m;
     $$('#modeSwitch .seg').forEach((b) => b.classList.toggle('is-active', b.dataset.mode === m));
     $('#modeHint').textContent = MODE_HINT[m];
-    $('#legacyLb').classList.toggle('hidden', m !== 'request');
     if (save) saveSettings({ mode: m }, '调度模式已切换为' + (m === 'session' ? '会话粘性' : '每次请求'));
   }
 
@@ -893,8 +881,6 @@
     state.creditsRefresh = credits || state.creditsRefresh;
     setMode(state.settings.mode);
     $('#failThreshold').value = state.settings.failThreshold ?? 3;
-    $('#expiryBusySec').value = Math.round((Number(state.settings.expiryBusyMs) || 0) / 1000);
-    syncExpiryInputs();
 
     const iv = Number(state.settings.creditsRefreshMs) || 0;
     const preset = $('#pollPreset');
@@ -1111,7 +1097,6 @@
     $('#keyWeight').value = '1';
     $('#keyPriority').value = '0';
     $('#keyEnabled').checked = true;
-    $('#keyDefault').checked = false;
     keyDlg.showModal();
     setTimeout(() => $('#keyLabel').focus(), 30);
   }
@@ -1127,7 +1112,6 @@
     $('#keyWeight').value = String(k.weight ?? 1);
     $('#keyPriority').value = String(k.priority ?? 0);
     $('#keyEnabled').checked = !!k.enabled;
-    $('#keyDefault').checked = !!k.isDefault;
     keyDlg.showModal();
     setTimeout(() => $('#keyLabel').focus(), 30);
   }
@@ -1148,6 +1132,7 @@
       state.keys = data.keys || [];
       state.loading = false;
       state.sessions = data.sessions || [];
+      state.poolOrder = data.poolOrder || [];
       if (typeof data.serverTime === 'number') state.serverSkew = data.serverTime - Date.now();
       fillLb(data.lb);
       fillSettings(data.settings, data.creditsRefresh);
@@ -1242,32 +1227,10 @@
   });
 
   /* ── 调度 / 轮询 / 会话 ──────────────────────────────── */
-  $('#lbStrategy').addEventListener('change', () => {
-    $('#stickyByWrap').style.display = $('#lbStrategy').value === 'sticky' ? '' : 'none';
-    updateStrategyHint();
-  });
-
   $('#modeSwitch').addEventListener('click', (e) => {
     const btn = e.target.closest('.seg[data-mode]');
     if (!btn || btn.dataset.mode === state.settings.mode) return;
     setMode(btn.dataset.mode, { save: true });
-  });
-
-  // 订阅到期优先：开关本身即时保存（和分配模式一致），不用点保存按钮。
-  // 这里只写 expiryFirst —— 判定窗口由表单里的输入框负责，别把没填的值冲成 0。
-  $('#lbExpiryFirst').addEventListener('change', async () => {
-    syncExpiryInputs();
-    const on = $('#lbExpiryFirst').checked;
-    try {
-      const saved = await api('/admin/api/lb', { method: 'PUT', body: JSON.stringify({ expiryFirst: on }) });
-      if (saved) state.lb = { ...state.lb, ...saved };
-      toast(on ? '已开启：优先用订阅最快过期的空闲 Key' : '已关闭订阅到期优先');
-    } catch (err) {
-      toast(err.message, 'err');
-      $('#lbExpiryFirst').checked = !on;
-      syncExpiryInputs();
-      await reload({ silent: true });
-    }
   });
 
   $('#lbForm').addEventListener('submit', async (e) => {
@@ -1278,18 +1241,14 @@
       const saved = await api('/admin/api/lb', {
         method: 'PUT',
         body: JSON.stringify({
-          strategy: $('#lbStrategy').value,
-          stickyBy: $('#lbStickyBy').value,
           maxRetries: Number($('#lbMaxRetries').value) || 0,
           cooldownMs: Number($('#lbCooldownMs').value) || 0,
-          expiryFirst: $('#lbExpiryFirst').checked,
         }),
       });
       if (saved) state.lb = saved;
       await saveSettings({
         mode: $('#modeSwitch .seg.is-active')?.dataset.mode || 'session',
         failThreshold: Number($('#failThreshold').value) || 3,
-        expiryBusyMs: Math.max(0, Math.min(3600, Number($('#expiryBusySec').value) || 0)) * 1000,
       }, '调度设置已保存');
     } catch (err) {
       toast(err.message, 'err');
@@ -1373,7 +1332,6 @@
       weight: Number($('#keyWeight').value) || 0,
       priority: Number($('#keyPriority').value) || 0,
       enabled: $('#keyEnabled').checked,
-      default: $('#keyDefault').checked,
     };
 
     if (!editId) {
@@ -1497,22 +1455,6 @@
     }
 
     if (act === 'edit') { openEdit(k); return; }
-
-    if (act === 'default') {
-      const next = !k.isDefault;
-      card.classList.add('is-busy');
-      try {
-        await api(`/admin/api/keys/${id}`, {
-          method: 'PATCH',
-          body: JSON.stringify({ default: next }),
-        });
-        toast(next ? `已设为默认：${label}` : '已取消默认 Key');
-        await reload({ silent: true });
-      } catch (err) {
-        card.classList.remove('is-busy');
-        toast(err.message, 'err');
-      }
-    }
   });
 
   /* 快捷启停 */

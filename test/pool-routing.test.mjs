@@ -4,7 +4,7 @@
 // 所以这里都用临时工作目录自己造一份 keys.json 来驱动调度逻辑。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, copyFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, copyFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -13,16 +13,17 @@ import { REPO, startMockUpstream, startProxy } from './helpers.mjs';
 const CHAT = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
 
 /** 造一个只属于本次测试的工作目录（自带 config.json 与 keys.json） */
-function makeCwd(keys, settings = {}, lb = {}) {
+function makeCwd(keys, settings = {}, lb = {}, defaultId = null) {
   const dir = mkdtempSync(join(tmpdir(), 'ccp-pool-'));
   copyFileSync(join(REPO, 'config.json'), join(dir, 'config.json'));
   writeFileSync(join(dir, 'keys.json'), JSON.stringify({
-    lb: { strategy: 'weighted', stickyBy: 'client-key', maxRetries: 2, cooldownMs: 60000, ...lb },
+    // 故意带上旧版本的旋钮：读取时应当被忽略
+    lb: { strategy: 'weighted', stickyBy: 'client-key', maxRetries: 2, cooldownMs: 60000, expiryFirst: true, ...lb },
     settings: {
       mode: 'session', failThreshold: 3, sessionTtlMs: 21600000,
-      creditsRefreshMs: 0, autoDisableExhausted: true, onAllExhausted: 'error', ...settings,
+      creditsRefreshMs: 0, autoDisableExhausted: true, onAllExhausted: 'error', expiryBusyMs: 300000, ...settings,
     },
-    keys, defaultId: null,
+    keys, defaultId,
   }, null, 2));
   return dir;
 }
@@ -221,7 +222,42 @@ test('CC_KEYS_FILE：Key 池写到指定路径（Docker 挂卷依赖这个）', 
   } finally { await proxy.kill(); await mock.close(); cleanup(dir); cleanup(home); }
 });
 
-/* ── 订阅到期优先（lb.expiryFirst） ───────────────────── */
+/* ── keys.json 健壮性（BOM / 坏 JSON 都不能把池子搞丢）── */
+
+test('keys.json 健壮性：带 BOM 能读出来，坏 JSON 会被挪到一边而不是被空池覆盖', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'ccp-robust-'));
+  copyFileSync(join(REPO, 'config.json'), join(home, 'config.json'));
+  const p = join(home, 'keys.json');
+  const mock = await startMockUpstream();
+  const seed = {
+    lb: { maxRetries: 1, cooldownMs: 60000 },
+    settings: { mode: 'session' },
+    keys: [mkKey('key_bom1', 'bom', 'user_bombombombombom01')],
+  };
+
+  // ① 带 BOM（Windows 记事本 / PowerShell 的默认产物）
+  writeFileSync(p, '\uFEFF' + JSON.stringify(seed), 'utf8');
+  let proxy = await startProxy({ upstreamPort: mock.port, cwd: home, env: { CC_KEYS_FILE: p } });
+  try {
+    const d = await (await proxy.get('/admin/api/keys')).json();
+    assert.equal(d.keys.length, 1, '带 BOM 的 keys.json 也应该能读出来');
+    assert.equal(d.keys[0].id, 'key_bom1');
+  } finally { await proxy.kill(); }
+
+  // ② 坏 JSON：挪到 .corrupt-* 留证据，而不是启动后把文件覆盖成空池
+  writeFileSync(p, '{ oops', 'utf8');
+  proxy = await startProxy({ upstreamPort: mock.port, cwd: home, env: { CC_KEYS_FILE: p } });
+  try {
+    const d = await (await proxy.get('/admin/api/keys')).json();
+    assert.equal(d.keys.length, 0, '读不出来时池子为空');
+    assert.match(proxy.logs(), /Key pool unreadable/, '应留下一条明确的错误日志');
+    const bak = readdirSync(home).find((f) => f.startsWith('keys.json.corrupt-'));
+    assert.ok(bak, '坏文件应被改名成 keys.json.corrupt-*');
+    assert.equal(readFileSync(join(home, bak), 'utf8'), '{ oops', '原文件内容必须原样保留');
+  } finally { await proxy.kill(); await mock.close(); cleanup(home); }
+});
+
+/* ── 池内选取顺序：真空闲 → 相对空闲 → priority → 到期 ── */
 
 /** 三个 Key：e1 最快到期（3 天）、e2（10 天）、e3（30 天）——故意打乱定义顺序 */
 function expiryKeys(base = Date.now()) {
@@ -239,62 +275,122 @@ async function boundKey(proxy, tag) {
   return s ? s.keyId : null;
 }
 
-test('订阅到期优先：新会话先占最快到期的 Key，被占用的让位给下一个空闲的', async () => {
-  const dir = makeCwd(expiryKeys(), {}, { expiryFirst: true });
-  const mock = await startMockUpstream();
-  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
-  const sess = (id) => proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': id });
-  try {
-    // 第一个会话 → 最快到期的 key_e1
-    await sess('sess-x-aaaaaa');
-    assert.equal(await boundKey(proxy, 'sess-x-aaaaaa'), 'key_e1', '应优先用订阅最快到期的 Key');
-
-    // key_e1 刚被使用（默认 5 分钟窗口内视为「有人在用」）→ 下一个空闲的是 key_e2
-    await sess('sess-x-bbbbbb');
-    assert.equal(await boundKey(proxy, 'sess-x-bbbbbb'), 'key_e2', '有人在用的 Key 应让位给下一个最快到期的空闲 Key');
-
-    // e1/e2 都在用 → 剩下最快到期的 key_e3
-    await sess('sess-x-cccccc');
-    assert.equal(await boundKey(proxy, 'sess-x-cccccc'), 'key_e3');
-
-    // 已有会话保持粘性，不因为到期排序被抢走
-    await sess('sess-x-aaaaaa');
-    assert.equal(await boundKey(proxy, 'sess-x-aaaaaa'), 'key_e1', '已有会话不应被抢走');
-  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
-});
-
-test('订阅到期优先：空闲判定窗口设为 0 时只有在途请求算「有人在用」', async () => {
-  const dir = makeCwd(expiryKeys(), { expiryBusyMs: 0 }, { expiryFirst: true });
-  const mock = await startMockUpstream();
-  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
-  const sess = (id) => proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': id });
-  try {
-    await sess('sess-z-aaaaaa');
-    await sess('sess-z-bbbbbb');
-    assert.equal(await boundKey(proxy, 'sess-z-aaaaaa'), 'key_e1');
-    assert.equal(await boundKey(proxy, 'sess-z-bbbbbb'), 'key_e1', '窗口为 0 时没有会话算忙，继续用最快到期的 Key');
-  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
-});
-
-test('订阅到期优先：默认关闭时不影响原有的会话分散', async () => {
+test('选取顺序：真空闲的 Key 按订阅最早到期逐个占用，已有会话的让位', async () => {
   const dir = makeCwd(expiryKeys());
   const mock = await startMockUpstream();
   const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
   const sess = (id) => proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': id });
   try {
-    await sess('sess-d-aaaaaa'); await sess('sess-d-bbbbbb'); await sess('sess-d-cccccc');
-    const list = await (await proxy.get('/admin/api/sessions')).json();
-    assert.equal(new Set(list.sessions.map((s) => s.keyId)).size, 3, '默认仍应分散到三个 Key');
+    await sess('sess-x-aaaaaa');
+    assert.equal(await boundKey(proxy, 'sess-x-aaaaaa'), 'key_e1', '第一个会话应落在订阅最快到期的空闲 Key');
+
+    // key_e1 已经有会话（不再真空闲）→ 下一个真空闲的是 key_e2
+    await sess('sess-x-bbbbbb');
+    assert.equal(await boundKey(proxy, 'sess-x-bbbbbb'), 'key_e2', '有人用的 Key 应让位给下一个真空闲的 Key');
+
+    await sess('sess-x-cccccc');
+    assert.equal(await boundKey(proxy, 'sess-x-cccccc'), 'key_e3', '三个 Key 应各占一个');
+
+    // 四个会话 > 三个 Key：多出来的回到订阅最早到期的那个
+    await sess('sess-x-dddddd');
+    assert.equal(await boundKey(proxy, 'sess-x-dddddd'), 'key_e1', '都不空闲时按到期顺序回头复用');
+
+    // 已有会话保持粘性，不因为排序被抢走
+    await sess('sess-x-aaaaaa');
+    assert.equal(await boundKey(proxy, 'sess-x-aaaaaa'), 'key_e1', '已有会话不应被抢走');
   } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
 });
 
-test('订阅到期优先：request 模式下在途请求占用的 Key 会让位', async () => {
+test('选取顺序：同为真空闲时先比 priority（数字小的优先），再比到期时间', async () => {
+  const base = Date.now();
+  const dir = makeCwd([
+    // 优先级低的到期更早：如果先比到期时间就会选错
+    mkKey('key_p9', 'low', 'user_prioprioprioprio09', { priority: 9, credits: creditsWithExpiry(base + 2 * DAY) }),
+    mkKey('key_p0', 'high', 'user_prioprioprioprio00', { priority: 0, credits: creditsWithExpiry(base + 20 * DAY) }),
+  ]);
+  const mock = await startMockUpstream();
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
+  try {
+    await proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': 'sess-prio-aa' });
+    assert.equal(await boundKey(proxy, 'sess-prio-aa'), 'key_p0', '同一层内 priority 小的先选，不被到期时间抢走');
+  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
+});
+
+test('选取顺序：真空闲优先于 priority（高优先级 Key 有人用了就让位）', async () => {
+  const dir = makeCwd([
+    mkKey('key_hi', 'hi', 'user_idleidleidleidle01', { priority: 0, credits: freshCredits() }),
+    mkKey('key_lo', 'lo', 'user_idleidleidleidle02', { priority: 9, credits: freshCredits() }),
+  ]);
+  const mock = await startMockUpstream();
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
+  const sess = (id) => proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': id });
+  try {
+    await sess('sess-i-aaaaaa');
+    assert.equal(await boundKey(proxy, 'sess-i-aaaaaa'), 'key_hi', '都真空闲时先比 priority');
+
+    await sess('sess-i-bbbbbb');
+    assert.equal(await boundKey(proxy, 'sess-i-bbbbbb'), 'key_lo', 'key_hi 已有会话 → 让位给真空闲的低优先级 Key');
+
+    await sess('sess-i-cccccc');
+    assert.equal(await boundKey(proxy, 'sess-i-cccccc'), 'key_hi', '两个都不是真空闲时，回到 priority 比较');
+  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
+});
+
+test('选取顺序：都不空闲时优先选活跃会话最少的 Key（相对空闲）', async () => {
+  const dir = makeCwd([
+    mkKey('key_a', 'A', 'user_relativeidle000001'),
+    mkKey('key_b', 'B', 'user_relativeidle000002'),
+  ]);
+  const mock = await startMockUpstream();
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
+  try {
+    for (let i = 0; i < 4; i++) {
+      const r = await proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': `sess-r-${i}000000` });
+      assert.equal(r.status, 200);
+    }
+    const list = await (await proxy.get('/admin/api/sessions')).json();
+    const tally = {};
+    for (const s of list.sessions) tally[s.keyId] = (tally[s.keyId] || 0) + 1;
+    assert.equal(tally.key_a, 2);
+    assert.equal(tally.key_b, 2);
+  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
+});
+
+test('默认 Key 已取消：defaultId 不再影响选取，也不再写回 keys.json', async () => {
+  const base = Date.now();
+  const keys = [
+    mkKey('key_d9', 'later', 'user_defaultdefault0009', { credits: creditsWithExpiry(base + 20 * DAY) }),
+    mkKey('key_d1', 'soon', 'user_defaultdefault0001', { credits: creditsWithExpiry(base + 2 * DAY) }),
+  ];
+  const dir = makeCwd(keys, {}, {}, 'key_d9');   // 旧配置里指定的默认 Key
+  const mock = await startMockUpstream();
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
+  try {
+    await proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': 'sess-d-aaaaaa' });
+    assert.equal(await boundKey(proxy, 'sess-d-aaaaaa'), 'key_d1', '默认 Key 不再有特权，仍按空闲顺序选');
+
+    // 任意一次落盘都不应再写 defaultId / 旧策略字段
+    const patch = await proxy.get('/admin/api/keys/key_d9', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ weight: 2 }),
+    });
+    assert.equal(patch.status, 200);
+    const saved = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8'));
+    assert.equal(saved.defaultId, undefined, 'defaultId 不应再写回');
+    assert.equal(saved.lb.strategy, undefined, '旧的 strategy 字段不应再写回');
+    assert.equal(saved.lb.expiryFirst, undefined, '旧的 expiryFirst 字段不应再写回');
+    assert.equal(saved.settings.expiryBusyMs, undefined, '旧的 expiryBusyMs 不应再写回');
+    assert.deepEqual(Object.keys(saved.lb).sort(), ['cooldownMs', 'maxRetries']);
+  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
+});
+
+test('选取顺序：request 模式下在途请求占用的 Key 会让位', async () => {
   const now = Date.now();
   const keys = [
     mkKey('key_i1', 'soon', 'user_iiiiiiiiiiiiiiii0001', { credits: creditsWithExpiry(now + 1 * DAY) }),
     mkKey('key_i2', 'later', 'user_iiiiiiiiiiiiiiii0002', { credits: creditsWithExpiry(now + 5 * DAY) }),
   ];
-  const dir = makeCwd(keys, { mode: 'request' }, { expiryFirst: true, maxRetries: 5 });
+  const dir = makeCwd(keys, { mode: 'request' }, { maxRetries: 5 });
   let release = () => {};
   const gate = new Promise((r) => { release = r; });
   let held = false;
@@ -309,7 +405,7 @@ test('订阅到期优先：request 模式下在途请求占用的 Key 会让位'
     for (let i = 0; i < 100 && !held; i++) await sleep(50);
     assert.ok(held, '第一个请求应已到达上游并保持未结束');
 
-    // key_i1 仍在途 → 第二个请求应挑下一个最快到期的空闲 Key
+    // key_i1 仍在途 → 第二个请求应挑真空闲的那个
     const second = await proxy.post('/v1/chat/completions', CHAT);
     assert.equal(second.status, 200);
 
@@ -320,11 +416,11 @@ test('订阅到期优先：request 模式下在途请求占用的 Key 会让位'
       .filter((s) => s.url === '/alpha/generate')
       .map((s) => (/user_i+0002/.test(String(s.headers.authorization || '')) ? 'key_i2' : 'key_i1'));
     assert.equal(sentKeyIds[0], 'key_i1', '第一个请求应落在订阅最快到期的 key_i1');
-    assert.ok(sentKeyIds.includes('key_i2'), `在途占用的 Key 应让位给下一个最快到期的空闲 Key，实际顺序：${sentKeyIds.join(' → ')}`);
+    assert.ok(sentKeyIds.includes('key_i2'), `在途占用的 Key 应让位给真空闲的 Key，实际顺序：${sentKeyIds.join(' → ')}`);
   } finally { release(); await proxy.kill(); await mock.close(); cleanup(dir); }
 });
 
-test('订阅到期信息：/admin/api/keys 透出到期时间，到期优先开关可持久化', async () => {
+test('管理接口：poolOrder 透出选取顺序，lb 只剩两个旋钮，旧字段静默忽略', async () => {
   const now = Date.now();
   const expiresAt = now + 7 * DAY;
   const dir = makeCwd([mkKey('key_sub1', 'A', 'user_subsubsubsubsub01', { credits: creditsWithExpiry(expiresAt) })]);
@@ -332,22 +428,26 @@ test('订阅到期信息：/admin/api/keys 透出到期时间，到期优先开�
   const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
   try {
     const d = await (await proxy.get('/admin/api/keys')).json();
-    assert.equal(d.lb.expiryFirst, false, '默认不开启到期优先');
+    assert.deepEqual(Object.keys(d.lb).sort(), ['cooldownMs', 'maxRetries'], 'lb 只应暴露还在用的旋钮');
+    assert.equal(d.defaultId, undefined, '不应再有默认 Key 字段');
+    assert.ok(Array.isArray(d.poolOrder), '应透出池内选取顺序');
+    assert.equal(d.poolOrder[0].id, 'key_sub1');
+    assert.equal(d.poolOrder[0].idle, true, '没有会话/在途的 Key 是真空闲');
+    assert.equal(d.poolOrder[0].sessions, 0);
+    assert.equal(d.poolOrder[0].inflight, 0);
     assert.equal(d.keys[0].expiresAt, expiresAt, '列表里应带订阅到期时间');
     assert.equal(d.keys[0].credits.subscription.planId, 'individual-go');
-    assert.equal(d.keys[0].credits.subscription.willRenew, true);
+    assert.equal(d.keys[0].isDefault, undefined, '卡片数据里不应再带 isDefault');
 
+    // 旧字段（strategy / expiryFirst / expiryBusyMs）照旧传也不该报错，只是被忽略
     const put = await proxy.get('/admin/api/lb', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expiryFirst: true, strategy: 'weighted', stickyBy: 'client-key', maxRetries: 2, cooldownMs: 60000 }),
+      body: JSON.stringify({ maxRetries: 3, cooldownMs: 30000, strategy: 'round-robin', expiryFirst: false }),
     });
     assert.equal(put.status, 200);
-    assert.equal((await put.json()).expiryFirst, true, 'PUT /admin/api/lb 应接受开关');
+    assert.deepEqual(await put.json(), { maxRetries: 3, cooldownMs: 30000 });
 
     const saved = JSON.parse(readFileSync(join(dir, 'keys.json'), 'utf8'));
-    assert.equal(saved.lb.expiryFirst, true, '开关应落盘');
-
-    const back = await (await proxy.get('/admin/api/keys')).json();
-    assert.equal(back.lb.expiryFirst, true, '重新读取应保持开启');
+    assert.deepEqual(saved.lb, { maxRetries: 3, cooldownMs: 30000 }, '旧旋钮不应落盘');
   } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
 });

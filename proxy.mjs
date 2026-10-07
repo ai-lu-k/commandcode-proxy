@@ -86,14 +86,16 @@ const KEYS_PATH = process.env.CC_KEYS_FILE
   ? resolve(process.env.CC_KEYS_FILE)
   : resolve(__dirname, 'keys.json');
 
+// 池内选取只有一套固定顺序，没有「默认 Key / 策略下拉 / 到期优先开关」这些旋钮：
+//   ① 真空闲：既没有在途请求、也没有活跃会话
+//   ② 相对空闲：在途请求少的优先，再看活跃会话少的
+//   ③ 每一层内部先比 priority（数字小 = 优先）
+//   ④ 订阅最快到期（到期后额度作废，先用掉快过期的）
+//   ⑤ 最久没被用过 → 权重高 → id 兜底
+// 复杂池子的关键点：多个用户的多个会话不许挤在同一个 Key 上抢额度。
 const LB_DEFAULTS = {
-  strategy: 'weighted',          // round-robin | weighted | random | weighted-random | sticky | least-recent | failover
-  stickyBy: 'client-key',        // none | ip | client-key
   maxRetries: 2,                 // 可重试失败时最多再换几个 key
   cooldownMs: 60000,             // 失败后暂时跳过
-  // 订阅到期优先：优先用「订阅最快到期」的 Key（快过期的额度先用掉），
-  // 正在被使用的 Key 让位给下一个最快到期的空闲 Key。开启后覆盖 strategy。
-  expiryFirst: false,
 };
 
 // 调度设置（中转站场景）：会话粘性 + 失败/额度触发转移 + 额度轮询
@@ -102,7 +104,6 @@ const SETTINGS_DEFAULTS = {
   failThreshold: 3,              // 同一会话在同一 Key 上连续失败几次后换 Key
   sessionTtlMs: 6 * 60 * 60 * 1000, // 会话绑定有效期（超时回收）
   creditsRefreshMs: 15 * 60 * 1000, // 服务端定时刷新额度间隔（默认 15 分钟），0 = 关闭
-  expiryBusyMs: 5 * 60 * 1000,   // 到期优先用：Key 上有在途请求，或最近这么久内有会话活动，就算「有人在用」
   autoDisableExhausted: true,    // 额度用尽自动停用（额度恢复后自动恢复）
   onAllExhausted: 'error',       // 池内全部不可用时：error（明确报错）| best-effort（仍然尝试）
   // 决策模型（typesafe/jev）：不是 chat 模型，只有 Provider API 的 /provider/v1/systemone，
@@ -116,13 +117,12 @@ let keyStore = {
   lb: { ...LB_DEFAULTS },
   settings: { ...SETTINGS_DEFAULTS },
   keys: [],
-  defaultId: null,
 };
-let rrIndex = 0;
-const wrrCurrent = new Map();
-
 /** 会话 → Key 绑定（会话粘性模式的核心状态，仅内存，重启后按需重建） */
 const sessionRoutes = new Map(); // sessionId → { keyId, boundAt, lastAt, failures, moved }
+
+/** 每个 Key 当前在途请求数（「真空闲」判定的一半依据） */
+const keyInflight = new Map(); // keyId → 在途请求数
 
 function newKeyId() {
   return 'key_' + crypto.randomBytes(4).toString('hex');
@@ -132,6 +132,17 @@ function findKey(id) {
   return keyStore.keys.find((k) => k.id === id) || null;
 }
 
+/** 负载均衡参数（只剩这两个旋钮；策略/默认 Key/到期开关都已取消） */
+function normalizeLb(raw) {
+  const r = raw || {};
+  const maxRetries = Number(r.maxRetries);
+  const cooldownMs = Number(r.cooldownMs);
+  return {
+    maxRetries: Number.isFinite(maxRetries) ? Math.max(0, Math.min(5, maxRetries | 0)) : LB_DEFAULTS.maxRetries,
+    cooldownMs: Number.isFinite(cooldownMs) ? Math.max(0, Math.min(3600000, cooldownMs | 0)) : LB_DEFAULTS.cooldownMs,
+  };
+}
+
 /** 设置项（带范围收敛，防止前端传脏数据） */
 function normalizeSettings(raw) {
   const s = { ...SETTINGS_DEFAULTS, ...(raw || {}) };
@@ -139,11 +150,6 @@ function normalizeSettings(raw) {
   s.failThreshold = Math.max(1, Math.min(20, Number(s.failThreshold) || SETTINGS_DEFAULTS.failThreshold));
   s.sessionTtlMs = Math.max(60000, Math.min(7 * 24 * 3600 * 1000, Number(s.sessionTtlMs) || SETTINGS_DEFAULTS.sessionTtlMs));
   s.creditsRefreshMs = Math.max(0, Math.min(24 * 3600 * 1000, Number(s.creditsRefreshMs) || 0));
-  // 显式 0 是合法值（只看在途请求），undefined 才回落到默认
-  const busyRaw = Number(s.expiryBusyMs);
-  s.expiryBusyMs = Number.isFinite(busyRaw)
-    ? Math.max(0, Math.min(3600 * 1000, busyRaw))
-    : SETTINGS_DEFAULTS.expiryBusyMs;
   s.autoDisableExhausted = s.autoDisableExhausted !== false;
   s.onAllExhausted = s.onAllExhausted === 'best-effort' ? 'best-effort' : 'error';
   // 告警配置（余额/失败率阈值 + 邮件/webhook 通道）随 Key 池一起持久化到 keys.json
@@ -154,14 +160,20 @@ function normalizeSettings(raw) {
     ? s.decisionPlans.map((x) => String(x).trim()).filter(Boolean)
     : [...DECISION_PLAN_HINTS];
   s.decisionKeyIds = Array.isArray(s.decisionKeyIds) ? s.decisionKeyIds.map((x) => String(x).trim()).filter(Boolean) : [];
+  // 只保留已知字段：旧版本下线过的旋钮（expiryBusyMs 等）读进来就丢掉，不再落盘
+  for (const k of Object.keys(s)) if (!(k in SETTINGS_DEFAULTS)) delete s[k];
   return s;
 }
 
 function loadKeyStore() {
   try {
-    const raw = JSON.parse(readFileSync(KEYS_PATH, 'utf-8'));
-    keyStore.lb = { ...LB_DEFAULTS, ...(raw?.lb || {}) };
-    keyStore.lb.expiryFirst = keyStore.lb.expiryFirst === true;
+    // 去掉 BOM：Windows 记事本 / PowerShell 存出来的 UTF-8 会带 BOM，
+    // 不剥掉会让 JSON.parse 直接失败，池子被当成空的（下一次保存就把 Key 全冲掉）
+    const text = readFileSync(KEYS_PATH, 'utf-8').replace(/^\uFEFF/, '');
+    const raw = JSON.parse(text);
+    // 旧版 keys.json 里的 defaultId / strategy / stickyBy / expiryFirst 一律忽略：
+    // 池内选取已经收敛成唯一一套顺序，读进来也不会再生效。
+    keyStore.lb = normalizeLb(raw?.lb);
     keyStore.settings = normalizeSettings(raw?.settings);
     keyStore.keys = (raw?.keys || []).filter((k) => k?.key).map((k) => ({
       id: k.id || newKeyId(),
@@ -181,16 +193,23 @@ function loadKeyStore() {
         : null,
       credits: k.credits && typeof k.credits === 'object' ? k.credits : null,
     }));
-    keyStore.defaultId = findKey(raw?.defaultId) ? raw.defaultId : null;
-    rrIndex = 0;
-    wrrCurrent.clear();
     sessionRoutes.clear();
-  } catch {
+  } catch (e) {
+    // 读不出来时必须留证据：把原文件挪到一边，否则之后的任何一次保存
+    // 都会用空池覆盖掉原来的 keys.json（BOM / 手改坏 JSON 都踩过这个坑）
+    try {
+      if (existsSync(KEYS_PATH)) {
+        const bak = `${KEYS_PATH}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        renameSync(KEYS_PATH, bak);
+        log('error', 'Key pool unreadable, moved aside', {
+          path: KEYS_PATH, backup: bak, message: e?.message,
+        });
+      }
+    } catch {}
     keyStore = {
       lb: { ...LB_DEFAULTS },
       settings: normalizeSettings(),
       keys: [],
-      defaultId: null,
     };
   }
 }
@@ -203,7 +222,6 @@ function saveKeyStore() {
     lb: keyStore.lb,
     settings: keyStore.settings,
     keys: keyStore.keys,
-    defaultId: keyStore.defaultId,
   }, null, 2), 'utf-8');
   renameSync(tmp, KEYS_PATH);
 }
@@ -234,76 +252,74 @@ function isKeyReady(k, now = Date.now()) {
 
 function poolCandidates(excludeTried, now = Date.now()) {
   const notTried = (k) => !excludeTried || !excludeTried.has(k.id);
-  const live = keyStore.keys.filter((k) => notTried(k) && isKeyReady(k, now));
+  // 与 session 模式同一套可用性判定（启用 / 未冷却 / 未被自动停用）
+  const live = keyStore.keys.filter((k) => notTried(k) && isKeyUsable(k, now));
   if (live.length) return live;
-  // 全在冷却时放行，避免无 key 可用
-  return keyStore.keys.filter((k) => notTried(k) && k.enabled && k.key);
+  // 全在冷却时放行，避免无 key 可用（但已停用 / 额度用尽的 Key 不放行）
+  return keyStore.keys.filter((k) => notTried(k) && k.enabled && k.key && !autoDisableActive(k, now));
 }
 
-function stickyValue(req, clientKey) {
-  const by = keyStore.lb.stickyBy || 'none';
-  if (by === 'ip') return req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || 'ip';
-  if (by === 'client-key') return clientKey || req?.socket?.remoteAddress || 'anon';
-  return null;
+/**
+ * 池内选取的唯一排序规则（没有策略开关，也没有默认 Key）。
+ *
+ * 排序键依次是：
+ *   ① 真空闲：既没有在途请求、也没有活跃会话 → 0，否则 1
+ *   ② priority：数字小的优先（同一层内部先比优先级）
+ *   ③ 在途请求数：少的优先（相对空闲）
+ *   ④ 活跃会话数：少的优先
+ *   ⑤ 订阅到期时间：快过期的优先（到期后额度作废，先用掉）
+ *   ⑥ 最久没被用过 → 权重高 → id 兜底（稳定）
+ *
+ * counts = activeSessionCounts()，调用方复用同一份快照，保证一轮里判定一致。
+ */
+function keyRank(k, counts) {
+  const inflight = keyInflight.get(k.id) || 0;
+  const sessions = counts.get(k.id) || 0;
+  return [
+    inflight === 0 && sessions === 0 ? 0 : 1,
+    Number.isFinite(+k.priority) ? +k.priority : 0,
+    inflight,
+    sessions,
+    keyExpiryAt(k),
+    k.lastUsedAt || 0,
+    -(Number(k.weight) || 0),
+  ];
 }
 
-function pickByStrategy(candidates, req, clientKey) {
+function compareRank(a, b) {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+function rankPool(pool, counts) {
+  return [...pool].sort((a, b) => compareRank(keyRank(a, counts), keyRank(b, counts))
+    || String(a.id).localeCompare(String(b.id)));
+}
+
+/** 从候选里挑一个（顺序见 keyRank） */
+function pickRanked(candidates, now = Date.now()) {
   if (!candidates.length) return null;
-  // 订阅到期优先开启时直接按到期时间排序，覆盖下面的所有策略
-  if (keyStore.lb.expiryFirst) return rankByExpiry(candidates)[0];
-  const strategy = keyStore.lb.strategy || 'weighted';
+  return rankPool(candidates, activeSessionCounts(now))[0];
+}
 
-  if (strategy === 'sticky') {
-    const sv = stickyValue(req, clientKey);
-    if (sv) {
-      let h = 0;
-      for (let i = 0; i < sv.length; i++) h = (h * 31 + sv.charCodeAt(i)) | 0;
-      return candidates[Math.abs(h) % candidates.length];
-    }
-  }
-
-  if (strategy === 'least-recent') {
-    return candidates.reduce((a, b) => ((a.lastUsedAt || 0) <= (b.lastUsedAt || 0) ? a : b));
-  }
-
-  if (strategy === 'failover') {
-    return [...candidates].sort((a, b) =>
-      (a.priority || 0) - (b.priority || 0) || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
-    )[0];
-  }
-
-  if (strategy === 'random') {
-    return candidates[Math.floor(Math.random() * candidates.length)];
-  }
-
-  if (strategy === 'round-robin') {
-    rrIndex = (rrIndex + 1) % candidates.length;
-    return candidates[rrIndex];
-  }
-
-  if (strategy === 'weighted-random') {
-    const total = candidates.reduce((s, k) => s + Math.max(0, k.weight || 0), 0);
-    if (total <= 0) return candidates[Math.floor(Math.random() * candidates.length)];
-    let r = Math.random() * total;
-    for (const k of candidates) {
-      r -= Math.max(0, k.weight || 0);
-      if (r <= 0) return k;
-    }
-    return candidates[candidates.length - 1];
-  }
-
-  // weighted — nginx 平滑加权轮询
-  let total = 0;
-  let best = null;
-  for (const k of candidates) {
-    const w = Math.max(0, k.weight || 0);
-    total += w;
-    const cur = (wrrCurrent.get(k.id) || 0) + w;
-    wrrCurrent.set(k.id, cur);
-    if (!best || cur > wrrCurrent.get(best.id)) best = k;
-  }
-  if (best && total > 0) wrrCurrent.set(best.id, wrrCurrent.get(best.id) - total);
-  return best;
+/** 管理页展示用：当前可用池的选取顺序（含每个 Key 的负载与到期时间） */
+function poolOrderView(now = Date.now()) {
+  const pool = keyStore.keys.filter((k) => isKeyUsable(k, now));
+  const counts = activeSessionCounts(now);
+  return rankPool(pool, counts).map((k) => {
+    const inflight = keyInflight.get(k.id) || 0;
+    const sessions = counts.get(k.id) || 0;
+    const expiresAt = keyExpiryAt(k);
+    return {
+      id: k.id,
+      label: k.label,
+      priority: Number.isFinite(+k.priority) ? +k.priority : 0,
+      inflight,
+      sessions,
+      idle: inflight === 0 && sessions === 0,
+      expiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
+    };
+  });
 }
 
 function markKeyUsed(entry) {
@@ -373,22 +389,13 @@ function isRetryableCcFailure(status, bodyText) {
 /**
  * 始终从 GUI 配置的 Key 池里选取上游 Key，忽略请求头里的 Authorization / x-api-key。
  * excludeTried: Set<keyId>，failover 重试时排除已试过的。
- * sticky 策略仍可用客户端 Key/IP 做哈希，但只影响落到哪个池内 Key，不会直通该 Key。
+ * 选取顺序见 keyRank（真空闲 → 相对空闲 → priority → 到期 → 最久未用）。
  */
 function pickUpstreamKey(clientKey, req, excludeTried) {
-  // 默认 Key 优先（未禁用、未冷却、本轮未试过）
-  if (keyStore.defaultId) {
-    const def = findKey(keyStore.defaultId);
-    if (def && def.enabled && def.key && !excludeTried?.has(def.id) && isKeyReady(def)) {
-      markKeyUsed(def);
-      return { apiKey: def.key, id: def.id, label: def.label };
-    }
-  }
-
   const candidates = poolCandidates(excludeTried);
   if (!candidates.length) return null;
 
-  const entry = pickByStrategy(candidates, req, clientKey);
+  const entry = pickRanked(candidates);
   if (!entry) return null;
   markKeyUsed(entry);
   return { apiKey: entry.key, id: entry.id, label: entry.label };
@@ -564,13 +571,9 @@ function activeSessionCounts(now = Date.now()) {
 }
 
 // ══════════════════════════════════════════════════════════
-// 订阅到期优先（lb.expiryFirst）
-// CC 订阅到期后额度就作废，所以「最快到期的先用掉」；但正在被使用的 Key
-// 不该再压请求 —— 让位给下一个最快到期的**空闲** Key。
+// 在途请求计数：判断一个 Key 是不是「真空闲」的依据之一
+// （另一半依据是会话绑定数，见 activeSessionCounts）
 // ══════════════════════════════════════════════════════════
-
-/** 每个 Key 当前在途请求数（判断「有人在用」的一部分） */
-const keyInflight = new Map(); // keyId → 在途请求数
 
 function keyInflightEnter(id) {
   if (!id) return;
@@ -589,42 +592,6 @@ function keyExpiryAt(k) {
   if (!c || c.error) return Infinity;
   const t = Number(c.expiresAt);
   return Number.isFinite(t) && t > 0 ? t : Infinity;
-}
-
-/** 当前「有人在用」的 Key：有在途请求，或最近 expiryBusyMs 内有会话活动 */
-function busyKeyIds(now = Date.now()) {
-  const busy = new Set();
-  for (const [id, n] of keyInflight) if (n > 0) busy.add(id);
-  const win = Math.max(0, Number(keyStore.settings.expiryBusyMs) || 0);
-  for (const rec of sessionRoutes.values()) {
-    if (win > 0 && now - (rec.lastAt || 0) <= win) busy.add(rec.keyId);
-  }
-  return busy;
-}
-
-/** 到期优先排序：空闲 Key 优先 → 最快到期优先 → 最久未用 → 权重高 → id 稳定兜底 */
-function rankByExpiry(pool, now = Date.now()) {
-  const busy = busyKeyIds(now);
-  return [...pool].sort((a, b) =>
-    Number(busy.has(a.id)) - Number(busy.has(b.id))
-    || keyExpiryAt(a) - keyExpiryAt(b)
-    || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
-    || (b.weight || 0) - (a.weight || 0)
-    || String(a.id).localeCompare(String(b.id)));
-}
-
-/** 分散选 Key：到期优先 → 活跃会话最少 → 默认 Key 优先 → 最久未用 → 权重最大 */
-function pickBySpreading(pool, now) {
-  if (!pool.length) return null;
-  // 订阅到期优先：先挑最快到期且空闲的 Key（已有会话仍按粘性走，不会被抢走）
-  if (keyStore.lb.expiryFirst) return rankByExpiry(pool, now)[0];
-  const counts = activeSessionCounts(now);
-  return [...pool].sort((a, b) =>
-    (counts.get(a.id) || 0) - (counts.get(b.id) || 0)
-    || Number(b.id === keyStore.defaultId) - Number(a.id === keyStore.defaultId)
-    || (a.lastUsedAt || 0) - (b.lastUsedAt || 0)
-    || (b.weight || 0) - (a.weight || 0)
-  )[0];
 }
 
 /** 会话模式下选 Key；abandoned 为本轮已放弃的 Key id */
@@ -652,9 +619,9 @@ function pickSessionKey(sessionId, clientKey, req, body, abandoned) {
     }
   }
 
-  // 2) 新会话 / 需要换 Key → 分散到活跃会话最少的可用 Key
+  // 2) 新会话 / 需要换 Key → 按 keyRank 的统一顺序挑（真空闲优先，其次相对空闲）
   const pool = keyStore.keys.filter((k) => isKeyUsable(k, now) && !tried.has(k.id));
-  const chosen = pickBySpreading(pool, now);
+  const chosen = pickRanked(pool, now);
   if (!chosen) return null;
   markKeyUsed(chosen);
   if (sessionId) {
@@ -791,12 +758,13 @@ function poolUnavailableResponse() {
   };
 }
 
-// 兼容旧函数名（handleModels 等仍在用）——同样只走池
+/**
+ * 兼容旧函数名（handleModels 等仍在用）——同样只走池。
+ * 选取规则与转发路径完全一致，不再区分模式。
+ */
 function getApiKey(headers) {
   const req = { headers, socket: { remoteAddress: '' } };
-  const picked = keyStore.settings.mode === 'session'
-    ? pickSessionKey(null, extractClientApiKey(headers), req, null, null)
-    : pickUpstreamKey(extractClientApiKey(headers), req, null);
+  const picked = pickUpstreamKey(extractClientApiKey(headers), req, null);
   return picked?.apiKey || null;
 }
 
@@ -1039,7 +1007,8 @@ log('info', 'Key pool loaded', {
   path: KEYS_PATH,
   keys: keyStore.keys.length,
   enabled: keyStore.keys.filter((k) => k.enabled).length,
-  strategy: keyStore.lb.strategy,
+  // 启动时的选取顺序（此时没有任何会话/在途，等价于 priority → 到期 → 最久未用）
+  order: poolOrderView().map((k) => k.label || k.id),
 });
 
 // 把上游错误体摘要成单行，便于日志排查。
@@ -2170,13 +2139,12 @@ function keyAllowsDecision(k) {
   return planAllowsDecision(k.credits?.plan, s.decisionPlans);
 }
 
-/** 决策模型专用的 Key 选取（只从满足套餐要求的 Key 里按策略挑） */
+/** 决策模型专用的 Key 选取（只从满足套餐要求的 Key 里按统一顺序挑） */
 function pickDecisionKey(excludeTried) {
   const candidates = keyStore.keys.filter((k) => k.enabled && k.key
     && !excludeTried?.has(k.id) && isKeyReady(k) && keyAllowsDecision(k));
   if (!candidates.length) return null;
-  const req = { headers: {}, socket: { remoteAddress: '' } };
-  const entry = pickByStrategy(candidates, req, '');
+  const entry = pickRanked(candidates);
   if (!entry) return null;
   markKeyUsed(entry);
   return { apiKey: entry.key, id: entry.id, label: entry.label };
@@ -4548,7 +4516,6 @@ function publicKeyView(k) {
     autoDisabled: k.autoDisabled || null,
     cooldownUntil: cooling ? k.cooldownUntil : 0,
     cooling,
-    isDefault: k.id === keyStore.defaultId,
     credits: k.credits,
     expiresAt: k.credits?.expiresAt ?? null,
     activeSessions: activeSessionCounts().get(k.id) || 0,
@@ -4817,15 +4784,11 @@ function serveUiFile(req, res, pathname) {
   res.end(readFileSync(f.path));
 }
 
-const LB_FIELDS = ['strategy', 'stickyBy', 'maxRetries', 'cooldownMs'];
-
+/** 负载均衡参数（只暴露还在用的两个旋钮；旧的策略字段一律忽略不报错） */
 function currentLbConfig() {
   return {
-    strategy: keyStore.lb.strategy,
-    stickyBy: keyStore.lb.stickyBy,
     maxRetries: keyStore.lb.maxRetries,
     cooldownMs: keyStore.lb.cooldownMs,
-    expiryFirst: keyStore.lb.expiryFirst === true,
   };
 }
 
@@ -4837,19 +4800,10 @@ async function handleAdminApi(req, res, url) {
     if (req.method === 'PUT') {
       const body = await readJsonOr400(req, res);
       if (!body) return;
-      // 布尔开关单独处理，别被下面的 Number() 吃掉
-      if (body.expiryFirst !== undefined) keyStore.lb.expiryFirst = !!body.expiryFirst;
-      for (const f of LB_FIELDS) {
-        if (body[f] === undefined) continue;
-        if (f === 'strategy' || f === 'stickyBy') keyStore.lb[f] = String(body[f]);
-        else keyStore.lb[f] = Number(body[f]) || 0;
-      }
-      const strategies = ['round-robin', 'weighted', 'random', 'weighted-random', 'sticky', 'least-recent', 'failover'];
-      const stickies = ['none', 'ip', 'client-key'];
-      if (!strategies.includes(keyStore.lb.strategy)) keyStore.lb.strategy = 'weighted';
-      if (!stickies.includes(keyStore.lb.stickyBy)) keyStore.lb.stickyBy = 'client-key';
-      keyStore.lb.maxRetries = Math.max(0, Math.min(5, keyStore.lb.maxRetries | 0));
-      keyStore.lb.cooldownMs = Math.max(0, Math.min(3600000, keyStore.lb.cooldownMs | 0));
+      // 只认这两个；strategy / stickyBy / expiryFirst 等旧字段静默忽略
+      if (body.maxRetries !== undefined) keyStore.lb.maxRetries = body.maxRetries;
+      if (body.cooldownMs !== undefined) keyStore.lb.cooldownMs = body.cooldownMs;
+      keyStore.lb = normalizeLb(keyStore.lb);
       saveKeyStore();
       return sendJSON(res, 200, currentLbConfig());
     }
@@ -4984,7 +4938,8 @@ async function handleAdminApi(req, res, url) {
         settings: { ...keyStore.settings, alerts: alerts.maskedConfig() },
         creditsRefresh: creditsRefreshState(),
         serverTime: Date.now(),
-        defaultId: keyStore.defaultId,
+        // 当前可用池的选取顺序（管理页照这个顺序展示，也是排查分配问题的入口）
+        poolOrder: poolOrderView(),
         sessions: sessionRoutesView(),
         keys: keyStore.keys.map(publicKeyView),
       });
@@ -5035,15 +4990,11 @@ async function handleAdminApi(req, res, url) {
       if (body.weight !== undefined) entry.weight = Math.max(0, Number(body.weight) || 0);
       if (body.enabled !== undefined) entry.enabled = !!body.enabled;
       if (body.priority !== undefined) entry.priority = Number(body.priority) || 0;
-      if (body.default === true) keyStore.defaultId = entry.id;
-      else if (body.default === false && keyStore.defaultId === entry.id) keyStore.defaultId = null;
       saveKeyStore();
       return sendJSON(res, 200, publicKeyView(entry));
     }
     if (req.method === 'DELETE') {
       keyStore.keys = keyStore.keys.filter((k) => k.id !== entry.id);
-      wrrCurrent.delete(entry.id);
-      if (keyStore.defaultId === entry.id) keyStore.defaultId = null;
       // 清掉指向该 Key 的会话绑定，让相关会话下次请求自动重绑
       for (const [sid, rec] of sessionRoutes) {
         if (rec.keyId === entry.id) sessionRoutes.delete(sid);

@@ -131,28 +131,41 @@ Env overrides: `CC_ALERT_ENABLED`, `CC_ALERT_SMTP_HOST/_PORT/_SECURE/_USER/_PASS
 
 Admin API: `GET|PUT /admin/api/alerts`, `POST /admin/api/alerts/test|check|clear`.
 
-### Subscription expiry first (`expiryFirst`)
+### Pool selection order (the only routing rule)
 
-A switch on the admin UI **调度与容错 (Scheduling)** tab (off by default, persisted as
-`lb.expiryFirst` in `keys.json`; see `README_zh.md` → 「订阅到期优先」 for the full table).
+The pool has exactly one selection rule — there is no default key, no strategy dropdown and no
+expiry-first switch. Candidates are always "enabled + not cooling down + not auto-disabled"
+(when every key is cooling down the cooldown filter is relaxed once so the pool never runs dry),
+then the following sort keys are compared **in order** and the first key wins:
 
-A Command Code subscription's unused quota is lost when the subscription ends, so this switch makes
-the pool spend the **soonest-expiring key first**: keys are ordered by subscription expiry (idle
-keys first, then soonest expiry) and the first one wins.
+| # | Sort key | Meaning |
+|---|----------|---------|
+| ① | **Truly idle** | no in-flight request *and* no active session |
+| ② | **priority** | inside the tier above, lower `priority` wins |
+| ③ | In-flight requests | fewer first (relatively idle) |
+| ④ | Active sessions | fewer first |
+| ⑤ | Subscription expiry | soonest expiry first (quota is lost when the subscription ends) |
+| ⑥ | Least recently used → higher weight → `id` | stable tiebreak |
 
-- **"In use" means** the key has an in-flight request, or saw session activity within
-  `settings.expiryBusyMs` (default 5 minutes, editable in the UI; `0` = in-flight requests only).
-  A key that is being used steps aside for the *next* soonest-expiring idle key.
-- **Overrides `strategy`** while enabled; an explicitly pinned `defaultId` and already-bound
-  sessions still win, so expiry ordering only affects new sessions and rebinds.
-- Expiry comes from the upstream `/alpha/billing/subscriptions` call the credit poll already makes
-  (`cancelAt` when cancelled, otherwise `currentPeriodEnd`) and is refreshed on the
-  `creditsRefreshMs` interval.
+Rationale:
+
+- **One key per still-live session**: session affinity pins a session to its key, while a *new*
+  session first looks for a key nobody is using and only shares one when every key already has an
+  owner. This keeps many users' sessions from fighting over the same quota window.
+- **"Truly idle" is measured by session bindings** (TTL `sessionTtlMs`, 6h default) — the old
+  "activity within N seconds" window is gone: as long as a session is bound to a key, that key
+  yields to new sessions.
+- **`priority` is the tiering knob**: give a batch of keys a smaller `priority` to drain them first.
 - Expiry is used for **ordering and display only** — an expired subscription never auto-disables a
   key by itself, so a just-renewed key whose data has not refreshed yet is not killed by mistake.
+  Keys with no subscription data sort last.
+- Legacy `lb.strategy` / `lb.stickyBy` / `lb.expiryFirst` / `settings.expiryBusyMs` / `defaultId`
+  are ignored on read and disappear from `keys.json` on the next save.
 
-Admin API: `GET|PUT /admin/api/lb` (`expiryFirst`); `GET /admin/api/keys` returns `expiresAt` and
-`credits.subscription` (`planId` / `status` / `willRenew` / `expiresAt`) per key.
+Admin API: `GET|PUT /admin/api/lb` now exposes only `maxRetries` / `cooldownMs` (legacy fields are
+accepted and ignored); `GET /admin/api/keys` returns `poolOrder` (the current selection order with
+`idle`/`inflight`/`sessions`/`priority`/`expiresAt`), plus `expiresAt` and `credits.subscription`
+(`planId` / `status` / `willRenew` / `expiresAt`) per key.
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 

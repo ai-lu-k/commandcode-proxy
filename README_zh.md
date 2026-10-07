@@ -163,38 +163,40 @@ Webhook 通道按地址自动识别格式：企业微信机器人、Bark、Serve
 | `POST` | `/admin/api/alerts/check` | 立刻体检一次（不等轮询窗口）|
 | `POST` | `/admin/api/alerts/clear` | 清空「未恢复」标记；`?history=1` 连历史一起清 |
 
-### 订阅到期优先（`expiryFirst`）
+### 池内选取顺序（唯一的调度规则）
 
-管理台「调度与容错」页的开关（默认**关**，落盘在 `keys.json` 的 `lb.expiryFirst`）。
+池子只有一套选取规则，没有「默认 Key / 策略下拉 / 到期优先开关」这些旋钮。候选池永远是
+「启用 + 未冷却 + 未被自动停用」的 Key（全部在冷却时会临时放宽一次，避免无人可用），
+然后按下面的排序键**依次**比较，取第一个：
 
-Command Code 订阅一到期，剩余额度就作废，所以这个开关让调度**优先把最快到期的 Key 用掉**：
-把 Key 按订阅到期时间排序，先空闲、再最快到期，选第一个。
+| # | 排序键 | 说明 |
+|---|--------|------|
+| ① | **真空闲** | 既没有在途请求、也没有活跃会话的 Key 全部排在前面 |
+| ② | **priority** | 上一层的内部先比 `priority`，数字小 = 优先 |
+| ③ | 在途请求数 | 少的优先（相对空闲）|
+| ④ | 活跃会话数 | 少的优先 |
+| ⑤ | 订阅到期时间 | 快过期的优先（到期后额度作废，先用掉）|
+| ⑥ | 最久未用 → 权重高 → `id` | 稳定兜底 |
 
-| 场景 | 行为 |
-|------|------|
-| 空闲 Key 中有最快到期的 | 选它 |
-| 最快到期的 Key 正在被使用 | 让位给**下一个**最快到期的空闲 Key |
-| 全部都在用 | 仍然按到期时间选（不排队、不拒绝） |
-| 额度数据里没有订阅信息 | 排到最后（拿不到到期时间的不抢优先级） |
+设计取舍：
 
-约定：
-
-- **「有人在用」的定义**：该 Key 上有**在途请求**，或最近 `settings.expiryBusyMs`（默认 5 分钟，
-  管理台可改，设为 0 = 只看在途请求）内有会话活动。正在跑的会话不会被抢走。
-- **开启后覆盖 `strategy`**：`strategy`（加权轮询/随机/粘性…）只在开关关闭时生效。
-- **显式指定的东西仍然优先**：默认 Key（`defaultId`）与已有会话的绑定不会被抢走。
-- 到期时间来自上游 `/alpha/billing/subscriptions`（已取消看 `cancelAt`，否则看 `currentPeriodEnd`），
-  由额度轮询（`creditsRefreshMs`）一并刷新。
+- **一个 Key 只留给一个「还没用完的会话」**：会话粘性让同一个会话始终落在同一个 Key 上；
+  新会话会先去找没人在用的 Key，实在都有人了才去挤相对空闲的那个。这是为了避免多个用户的
+  多个会话同时压在同一个额度上互相抢。
+- **「真空闲」按会话绑定数判定**（TTL `sessionTtlMs`，默认 6 小时），不再有「最近 N 秒内有活动」
+  这种时间窗口 —— 一个 Key 上只要还挂着会话，它就优先让给新会话去别处。
+- **priority 是分层开关**：想让一批 Key 先用完再用下一批，就给它们填小一点的 `priority`。
+- **到期时间只用于排序与显示**：订阅过期不会自动停用 Key —— 真停用仍由额度/失败检测决定，
+  避免把「刚续费但数据还没刷新」的 Key 误杀。没有订阅数据的 Key 排到最后。
+- 老的 `lb.strategy` / `lb.stickyBy` / `lb.expiryFirst` / `settings.expiryBusyMs` / `defaultId`
+  读进来会被忽略，并在下一次落盘时从 `keys.json` 里消失。
 
 管理台与 API：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| `GET`/`PUT` | `/admin/api/lb` | `expiryFirst` 开关（PUT 只写传入字段）|
-| `GET` | `/admin/api/keys` | 每个 Key 带 `expiresAt` 与 `credits.subscription`（`planId`/`status`/`willRenew`/`expiresAt`）|
-
-> 到期时间只用于**排序与显示**：订阅过期不会自动停用 Key —— 真停用仍由额度/失败检测决定，
-> 避免把「刚续费但数据还没刷新」的 Key 误杀。
+| `GET`/`PUT` | `/admin/api/lb` | 只剩 `maxRetries` / `cooldownMs`（旧字段传了也不报错，只是被忽略）|
+| `GET` | `/admin/api/keys` | `poolOrder` = 当前可用池的选取顺序（含 `idle`/`inflight`/`sessions`/`priority`/`expiresAt`）；每个 Key 带 `expiresAt` 与 `credits.subscription`（`planId`/`status`/`willRenew`/`expiresAt`）|
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
