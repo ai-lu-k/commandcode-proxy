@@ -141,9 +141,9 @@ then the following sort keys are compared **in order** and the first key wins:
 | # | Sort key | Meaning |
 |---|----------|---------|
 | ① | **Truly idle** | no in-flight request *and* no active session |
-| ② | **priority** | inside the tier above, lower `priority` wins |
-| ③ | In-flight requests | fewer first (relatively idle) |
-| ④ | Active sessions | fewer first |
+| ② | In-flight requests | fewer first |
+| ③ | Active sessions | fewer first → sessions spread evenly |
+| ④ | **priority** | when the three above tie, lower `priority` wins |
 | ⑤ | Subscription expiry | soonest expiry first (quota is lost when the subscription ends) |
 | ⑥ | Least recently used → higher weight → `id` | stable tiebreak |
 
@@ -155,7 +155,10 @@ Rationale:
 - **"Truly idle" is measured by session bindings** (TTL `sessionTtlMs`, 6h default) — the old
   "activity within N seconds" window is gone: as long as a session is bound to a key, that key
   yields to new sessions.
-- **`priority` is the tiering knob**: give a batch of keys a smaller `priority` to drain them first.
+- **⚠️ `priority` must sort *after* the load keys.** Put it earlier and the moment no key is truly
+  idle any more the load keys stop mattering: the key with the best `priority` then swallows *every*
+  new session (measured in production on 2026-10-08 — goat took 7 sessions in a row). Its meaning is
+  "who wins when the load is equal", not "who is chosen regardless of load".
 - Expiry is used for **ordering and display only** — an expired subscription never auto-disables a
   key by itself, so a just-renewed key whose data has not refreshed yet is not killed by mistake.
   Keys with no subscription data sort last.
