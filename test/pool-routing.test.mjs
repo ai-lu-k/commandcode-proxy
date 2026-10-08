@@ -356,6 +356,28 @@ test('选取顺序：都不空闲时优先选活跃会话最少的 Key（相对�
   } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
 });
 
+test('选取顺序（回归）：priority 不能压过负载 —— 会话必须铺开，不能全挤在一个 Key 上', async () => {
+  // 线上踩过的坑：priority 排在会话数之前时，只要某个 Key 优先级高一点点，
+  // 所有 Key 都不再真空闲之后它就独吞全部会话（实测 goat 连续吃 7 个）。
+  const dir = makeCwd([
+    mkKey('key_good', 'good', 'user_prioonlyonlyonly01', { priority: 0, credits: freshCredits() }),
+    mkKey('key_meh', 'meh', 'user_prioonlyonlyonly02', { priority: 5, credits: freshCredits() }),
+  ]);
+  const mock = await startMockUpstream();
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: dir });
+  try {
+    for (let i = 0; i < 6; i++) {
+      const r = await proxy.post('/v1/chat/completions', CHAT, { 'x-cc-session': `sess-p-${i}000000` });
+      assert.equal(r.status, 200);
+    }
+    const list = await (await proxy.get('/admin/api/sessions')).json();
+    const tally = {};
+    for (const s of list.sessions) tally[s.keyId] = (tally[s.keyId] || 0) + 1;
+    assert.equal(tally.key_good, 3, '高优先级 Key 不能多吃');
+    assert.equal(tally.key_meh, 3, '低优先级 Key 也要被平均用上');
+  } finally { await proxy.kill(); await mock.close(); cleanup(dir); }
+});
+
 test('默认 Key 已取消：defaultId 不再影响选取，也不再写回 keys.json', async () => {
   const base = Date.now();
   const keys = [

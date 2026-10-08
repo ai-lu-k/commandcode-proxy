@@ -264,11 +264,16 @@ function poolCandidates(excludeTried, now = Date.now()) {
  *
  * 排序键依次是：
  *   ① 真空闲：既没有在途请求、也没有活跃会话 → 0，否则 1
- *   ② priority：数字小的优先（同一层内部先比优先级）
- *   ③ 在途请求数：少的优先（相对空闲）
- *   ④ 活跃会话数：少的优先
+ *   ② 在途请求数：少的优先
+ *   ③ 活跃会话数：少的优先（→ 会话均匀铺开，不会全挤在一个 Key 上）
+ *   ④ priority：数字小的优先
  *   ⑤ 订阅到期时间：快过期的优先（到期后额度作废，先用掉）
  *   ⑥ 最久没被用过 → 权重高 → id 兜底（稳定）
+ *
+ * ⚠️ priority 必须排在负载之后：它一旦排在前面，只要某个 Key 的优先级高一点点，
+ * 后续所有会话都会被它吃光（每个 Key 都不再真空闲时，负载就完全不起作用了）——
+ * 2026-10-08 线上实测踩过这个坑（goat 连续吃 7 个会话）。priority 的正确语义是
+ * 「负载相同时先选谁」，不是「无视负载一直选谁」。
  *
  * counts = activeSessionCounts()，调用方复用同一份快照，保证一轮里判定一致。
  */
@@ -277,9 +282,9 @@ function keyRank(k, counts) {
   const sessions = counts.get(k.id) || 0;
   return [
     inflight === 0 && sessions === 0 ? 0 : 1,
-    Number.isFinite(+k.priority) ? +k.priority : 0,
     inflight,
     sessions,
+    Number.isFinite(+k.priority) ? +k.priority : 0,
     keyExpiryAt(k),
     k.lastUsedAt || 0,
     -(Number(k.weight) || 0),
