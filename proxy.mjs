@@ -53,6 +53,15 @@ const WB_DEFAULTS = {
   breakerOpenMs: 180000,     // 第一次摘掉 3 分钟
   breakerMaxOpenMs: 1800000, // 反复熔断时最长摘掉 30 分钟
   channels: [],              // 空 = 只有隐式默认渠道（保持接入前的行为）
+  // ── 出口端口 ─────────────────────────────────
+  // 一个 hub 有两个出口（国际版 / 国内版）。这里把它们拆成两个端口对外，站点各开
+  // 一个渠道同时用（每个渠道一个 base_url），分流交给站点；每个出口内部再用 hub
+  // 自己的账号池做负载均衡。端口 → 版本的映射是显式配置，不再靠模型名猜。
+  // 主端口固定走 exit1Realm；exit2Port 另起一个监听，固定走 exit2Realm。
+  // exit2Port=0 表示不开第二个出口，行为与接入前完全一致。
+  exit1Realm: 'intl',
+  exit2Port: 3051,
+  exit2Realm: 'cn',
 };
 
 function loadConfig() {
@@ -122,6 +131,9 @@ function loadConfig() {
   if (process.env.WB_HUB_API_KEY) defaults.workbuddy.hubApiKey = process.env.WB_HUB_API_KEY;
   if (process.env.WB_UPSTREAM_URL) defaults.workbuddy.upstreamUrl = process.env.WB_UPSTREAM_URL;
   if (process.env.WB_MANAGER_URL) defaults.workbuddy.managerUrl = process.env.WB_MANAGER_URL;
+  if (process.env.WB_EXIT1_REALM !== undefined) defaults.workbuddy.exit1Realm = process.env.WB_EXIT1_REALM;
+  if (process.env.WB_EXIT2_PORT !== undefined) defaults.workbuddy.exit2Port = parseInt(process.env.WB_EXIT2_PORT, 10) || 0;
+  if (process.env.WB_EXIT2_REALM !== undefined) defaults.workbuddy.exit2Realm = process.env.WB_EXIT2_REALM;
   if (process.env.WB_DISABLED === '1') defaults.workbuddy.enabled = false;
 
   return defaults;
@@ -5087,6 +5099,35 @@ const WB_CN_PREFIXES = ['minimax-', 'deepseek-v4-pro'];
 
 const wbChannelStats = new Map();   // id -> { samples, cursor, lastError }（纯运行时）
 
+// 按路径前缀统计进来的请求数（纯运行时）。排查「请求到底有没有走到这儿」时这是
+// 第一现场 —— 比在两端各自数日志快得多，管理台的「渠道与熔断」会一并显示。
+const requestCounters = { total: 0, byPath: {}, since: Date.now() };
+function countRequest(pathname) {
+  requestCounters.total++;
+  const seg = String(pathname || '/').split('/').filter(Boolean).slice(0, 2).join('/');
+  const key = '/' + seg;
+  requestCounters.byPath[key] = (requestCounters.byPath[key] || 0) + 1;
+}
+
+// 出口内部各阶段的计数（纯运行时）。「请求到了反代但没进渠道池」这类问题，
+// 光看两端日志对不出来，这里把 enter / noPlan / forward / record 四步分开数。
+const wbEgressDiag = {
+  enter: 0, disabled: 0, noPlan: 0, forward: 0, record: 0, retry: 0, error: 0, lastPath: '', lastModel: '',
+};
+function wbDiag(step, extra = {}) {
+  if (step in wbEgressDiag) wbEgressDiag[step]++;
+  Object.assign(wbEgressDiag, extra);
+}
+
+// 最近 20 次出口转发的结局（纯运行时）。排查「某个出口在报什么错」时，
+// 两端的日志都只记了一半，这里把 path / 模型 / 出口 / 端口 / 状态 / 耗时 / 错误原文
+// 一次记全 —— 出问题直接看这一条。
+const wbRecent = [];
+function wbNoteRecent(entry) {
+  wbRecent.push({ at: Date.now(), ...entry });
+  if (wbRecent.length > 20) wbRecent.shift();
+}
+
 function newWbChannelId() {
   return 'wb' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 }
@@ -5243,6 +5284,8 @@ function wbChannelView(ch) {
     },
     breakerActive: wbBreakerActive(ch),
     eligible: ch.enabled && !wbBreakerActive(ch),
+    // 这个出口对应哪个端口（站点渠道就是照它配 base_url 的）
+    port: (wbExits().find((e) => e.realm === ch.realm) || {}).port || null,
   };
 }
 
@@ -5252,17 +5295,26 @@ function wbChannelView(ch) {
  *  熔断的渠道不排在最前，但**仍然留在计划末尾当兜底** ——「暂时关闭」是为了别把
  *  慢的排在最前，不是为了在唯一健康的那条 429 时整站不可用。
  *  手动停用则是绝对的：连兜底都不给（enabled=false 直接出池）。
+ *
+ *  forcedRealm 非空表示「这个请求是从某个出口端口进来的」，出口已经定死，不再
+ *  按模型名猜版本：只在这个版本的渠道里挑。挑不到就返回空数组，交给调用方用隐式
+ *  渠道 + X-Realm 兜底。
  */
-function wbPlan(model) {
-  const all = (keyStore.wbChannels || []).filter((c) => c.enabled);
+function wbPlan(model, forcedRealm = '') {
+  let all = (keyStore.wbChannels || []).filter((c) => c.enabled);
   if (!all.length) return [];
-  const owner = wbModelRealm(model);
-  let pool = all.filter((c) => !c.realm || !owner || owner === c.realm);
-  // 全被 realm 筛掉（渠道没配 realm 或配错了）：宁可试一把，让上游的「只在国际版
-  // 提供」暴出来，也不要在这里静默 503。
-  if (!pool.length) pool = all;
-  const alive = pool.filter((c) => !wbBreakerActive(c));
-  const base = alive.length ? alive : pool;
+  if (forcedRealm) {
+    all = all.filter((c) => c.realm === forcedRealm);
+    if (!all.length) return [];
+  } else {
+    const owner = wbModelRealm(model);
+    const scoped = all.filter((c) => !c.realm || !owner || owner === c.realm);
+    // 全被 realm 筛掉（渠道没配 realm 或配错了）：宁可试一把，让上游的「只在国际版
+    // 提供」暴出来，也不要在这里静默 503。
+    if (scoped.length) all = scoped;
+  }
+  const alive = all.filter((c) => !wbBreakerActive(c));
+  const base = alive.length ? alive : all;
   const top = Math.max(...base.map((c) => c.priority));
   const tier = base.filter((c) => c.priority === top);
   // 一次平滑加权轮询 tick：同层每条加自己的权重，最大者当主渠道，再扣掉总权重
@@ -5278,6 +5330,22 @@ function wbPlan(model) {
   return plan.slice(0, 3);
 }
 
+/** 出口端口 → 版本。两个端口就是两个出口，站点各开一个渠道同时用；
+ *  每个出口内部再由 hub 自己的账号池做负载均衡。 */
+function wbExits() {
+  const w = WB();
+  // realm 为空字符串 = 这个端口不钉版本（回到「按模型名猜」的旧行为）
+  const list = [{ port: CFG.port, realm: String(w.exit1Realm ?? 'intl') }];
+  const p2 = Number(w.exit2Port) || 0;
+  if (p2 > 0 && p2 !== CFG.port) list.push({ port: p2, realm: String(w.exit2Realm ?? 'cn') });
+  return list;
+}
+
+function wbRealmForPort(port) {
+  const hit = wbExits().find((e) => e.port === Number(port));
+  return hit ? hit.realm : '';
+}
+
 function wbCrossRealmError(text) {
   const t = String(text || '');
   return t.includes('只在国际版提供') || t.includes('只在国内版提供')
@@ -5291,8 +5359,10 @@ function wbCrossRealmError(text) {
    与 CC 的 /v1/* 完全独立 —— 那边是站点渠道正在用的出口，一个字节都不动。
    逐块透传、不缓冲，否则 SSE 流会被憋住。 */
 async function handleWorkbuddyEgress(req, res, url) {
+  wbDiag('enter', { lastPath: url.pathname });
   const cfg = WB();
   if (!cfg.enabled) {
+    wbDiag('disabled');
     return sendJSON(res, 503, { error: { message: 'WorkBuddy 出口已关闭', type: 'server_busy' } });
   }
   // /wb/v1/chat/completions -> /v1/chat/completions
@@ -5311,11 +5381,13 @@ async function handleWorkbuddyEgress(req, res, url) {
 
   const channels = keyStore.wbChannels || [];
   const model = wbModelOfBody(body);
-  // 没配渠道池 = 接入前的行为：单条隐式渠道
-  const plan = channels.length ? wbPlan(model) : [null];
-  if (!plan.length) {
-    return sendJSON(res, 503, { error: { message: 'WorkBuddy 没有启用的渠道', type: 'server_busy' } });
-  }
+  wbDiag('model', { lastModel: model });
+  // 端口决定出口版本；池子里这个版本一个渠道都没配时退回隐式渠道（靠 X-Realm 说话）。
+  const exitRealm = wbRealmForPort(req.socket?.localPort);
+  let plan = channels.length ? wbPlan(model, exitRealm) : [null];
+  // 这个版本一个渠道都没配（或全被停用）→ 退回隐式渠道，靠 X-Realm 说话
+  if (!plan.length) { wbDiag('noPlan'); plan = [null]; }
+  wbDiag('forward');
 
   let lastError = '';
   let lastStatus = 0;
@@ -5325,8 +5397,10 @@ async function handleWorkbuddyEgress(req, res, url) {
     const headers = { ...baseHeaders };
     const apiKey = ch?.apiKey || cfg.hubApiKey;
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-    // 渠道钉了出口就显式声明；hub 的优先级是 显式参数 > key 绑定 > X-Realm 头 > 全局开关。
-    if (ch?.realm) headers['X-Realm'] = ch.realm;
+    // 出口版本：渠道自己钉的优先，否则用请求进来的那个端口对应的版本。
+    // hub 的优先级是 显式参数 > key 绑定 > X-Realm 头 > 全局开关。
+    const realm = ch?.realm || exitRealm;
+    if (realm) headers['X-Realm'] = realm;
 
     const ac = new AbortController();
     const onClose = () => ac.abort();
@@ -5338,6 +5412,7 @@ async function handleWorkbuddyEgress(req, res, url) {
     } catch (e) {
       res.removeListener('close', onClose);
       if (ch) wbRecordSample(ch, { at: Date.now(), ttfb: Date.now() - t0, ok: false, status: 0, error: e.message });
+      wbNoteRecent({ path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort, status: 0, ok: false, err: e.message });
       lastError = 'WorkBuddy hub 不可达：' + e.message;
       if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } return; }
       continue;
@@ -5349,10 +5424,11 @@ async function handleWorkbuddyEgress(req, res, url) {
     // 渠道，429/5xx 在客户端看来就是「这个模型坏了」。
     let retry = WB_RETRY_STATUS.has(upstream.status);
     let errorText = null;
-    if (upstream.status === 400 && canRetry) {
-      // 跨出口的错误是 400，只有读到 body 才知道它其实是「走错版本了」
+    if (upstream.status >= 400) {
+      // 读错误体有两个用处：① 跨出口的 400 只有读到 body 才知道它其实是「走错版本
+      // 了」，值得换一条；② 把原文记进最近请求环，排查时不用再猜。
       errorText = await upstream.text().catch(() => '');
-      retry = wbCrossRealmError(errorText);
+      if (upstream.status === 400) retry = wbCrossRealmError(errorText);
     }
     if (retry && canRetry) {
       try { await upstream.body?.cancel(); } catch { /* 无所谓 */ }
@@ -5360,6 +5436,10 @@ async function handleWorkbuddyEgress(req, res, url) {
       if (ch) {
         wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: upstream.status, error: `${upstream.status}` });
       }
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
+        status: upstream.status, ok: false, ttfb, err: '换下一条：' + String(errorText || '').slice(0, 120),
+      });
       lastStatus = upstream.status;
       log('warn', 'WorkBuddy 渠道失败，换下一条', {
         channel: ch?.name || '默认', status: upstream.status, next: plan[i + 1]?.name || '默认',
@@ -5389,6 +5469,12 @@ async function handleWorkbuddyEgress(req, res, url) {
           at: Date.now(), ttfb, totalMs: Date.now() - t0, ok, status: upstream.status,
         })) saveKeyStore();
       }
+      wbDiag('record');
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
+        status: upstream.status, ok: upstream.status < 400, ttfb, totalMs: Date.now() - t0,
+        err: upstream.status < 400 ? '' : String(errorText || '').slice(0, 200),
+      });
       return;
     } catch (e) {
       if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } }
@@ -5396,6 +5482,10 @@ async function handleWorkbuddyEgress(req, res, url) {
       if (ch && !res.headersSent) {
         if (wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: 0, error: e.message })) saveKeyStore();
       }
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
+        status: 0, ok: false, ttfb, err: '流中断：' + e.message,
+      });
       return;
     } finally {
       res.removeListener('close', onClose);
@@ -5599,6 +5689,10 @@ async function handleAdminApi(req, res, url) {
         hubUrl: WB().hubUrl,
         hubApiKeySet: !!WB().hubApiKey,
         implicit: !(keyStore.wbChannels || []).length,   // 没配渠道 = 走隐式默认出口
+        exits: wbExits(),                                 // 端口 → 出口版本
+        requests: requestCounters,
+        diag: wbEgressDiag,
+        recent: wbRecent,
         serverTime: Date.now(),
       });
     }
@@ -5792,7 +5886,9 @@ async function handleAdminApi(req, res, url) {
 
 // ── 服务器 ──────────────────────────────────────────
 
-const server = http.createServer(async (req, res) => {
+/** 两个出口端口共用的请求处理。出口版本不看端口而是看 URL 里的路径，
+ *  端口只决定 /wb/v1/* 转发时钉哪个版本（见 handleWorkbuddyEgress）。 */
+async function handleRequest(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -5805,6 +5901,15 @@ const server = http.createServer(async (req, res) => {
 
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
+
+  // 第二个出口端口是专用通道：只认 /wb/v1/*（和 /health）。别的路径一律 404，
+  // 免得管理台或 CC 的 /v1/* 也从这儿打进来 —— 那是另一个出口的事。
+  const exitList = wbExits();
+  const onExit2 = exitList.length > 1 && Number(req.socket?.localPort) === exitList[1].port;
+  if (onExit2 && url.pathname !== '/health' && url.pathname !== '/wb' && !url.pathname.startsWith('/wb/')) {
+    sendJSON(res, 404, { error: { message: 'Not found on this exit port', type: 'not_found' } });
+    return;
+  }
 
   // 生成类请求的成功/失败样本 → 告警引擎的失败率统计。
   // 只认最终 HTTP 状态码：客户端主动断连（不触发 finish）不计入，避免把用户取消算成失败。
@@ -5869,6 +5974,8 @@ const server = http.createServer(async (req, res) => {
     res.once('close', release);
   }
 
+  countRequest(url.pathname);
+
   try {
     // WorkBuddy 对外出口。刻意放在 CC 的 /v1/* 之前且路径完全分开：
     // 站点渠道正在打 /v1/*，那条链路不能受这里影响。
@@ -5906,7 +6013,22 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
   }
-});
+}
+
+const server = http.createServer(handleRequest);
+
+// 第二个出口端口：出口版本由端口定死，两个端口上的站点渠道可以同时使用 ——
+// 每个出口内部再由 hub 自己的账号池做负载均衡，这里只负责把版本钉对。
+for (const e of wbExits()) {
+  if (e.port === CFG.port) continue;
+  const s = http.createServer(handleRequest);
+  s.listen(e.port, CFG.host, () => {
+    log('info', 'WorkBuddy exit listening', { port: e.port, realm: e.realm });
+  });
+  s.on('error', (err) => {
+    log('error', 'WorkBuddy exit port failed to listen', { port: e.port, realm: e.realm, message: err.message });
+  });
+}
 
 // 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
 process.on('unhandledRejection', (reason) => {

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startMockUpstream, startProxy } from './helpers.mjs';
+import { allocPort, startMockUpstream, startProxy } from './helpers.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 慢渠道的首字延迟；阈值设得比它低一点点，好让「慢」这件事确定发生
@@ -41,7 +41,11 @@ test('渠道池：轮询 / 熔断 / 重试 / 手动开关 / 阈值落盘', async
     wbChannels: [ch('c-fast', '快', fast.port), ch('c-slow', '慢', slow.port)],
   }, null, 2));
 
-  const proxy = await startProxy({ upstreamPort: fast.port, cwd: workdir });
+  const proxy = await startProxy({
+    upstreamPort: fast.port, cwd: workdir,
+    // 本用例只验池子内部的行为，不占第二个出口端口（并行跑测试文件时免得抢端口）
+    env: { WB_EXIT2_PORT: '0' },
+  });
   const chat = () => proxy.post('/wb/v1/chat/completions', CHAT);
   const view = async () => (await proxy.get('/admin/api/wb/channels')).json();
   const patch = (id, body) => fetch(`${proxy.base}/admin/api/wb/channels/${id}`, {
@@ -144,7 +148,11 @@ test('realm 预筛：只在某一版提供的模型不会被送去另一版', as
       { id: 'c-cn', name: '国内', realm: 'cn', hubUrl: `http://127.0.0.1:${cn.port}`, weight: 1, priority: 0, enabled: true },
     ],
   }, null, 2));
-  const proxy = await startProxy({ upstreamPort: intl.port, cwd: workdir });
+  const proxy = await startProxy({
+    upstreamPort: intl.port, cwd: workdir,
+    // 这条用例验的是「不按端口钉版本」时的按模型名分流（旧行为）
+    env: { WB_EXIT2_PORT: '0', WB_EXIT1_REALM: '' },
+  });
   t.after(async () => {
     await proxy.kill();
     await Promise.all([intl.close(), cn.close()]);
@@ -170,5 +178,60 @@ test('realm 预筛：只在某一版提供的模型不会被送去另一版', as
     await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
     assert.equal(intl.seen.length, 2);
     assert.equal(cn.seen.length, 2);
+  });
+});
+
+test('两个端口 = 两个出口：端口定死版本，各走各的', async (t) => {
+  const intl = await startMockUpstream({});
+  const cn = await startMockUpstream({});
+  const exit2 = await allocPort();
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-wbexit-'));
+  writeFileSync(join(workdir, 'keys.json'), JSON.stringify({
+    lb: {}, settings: {}, keys: [],
+    wbChannels: [
+      { id: 'c-intl', name: '国际', realm: 'intl', hubUrl: `http://127.0.0.1:${intl.port}`, weight: 1, priority: 0, enabled: true },
+      { id: 'c-cn', name: '国内', realm: 'cn', hubUrl: `http://127.0.0.1:${cn.port}`, weight: 1, priority: 0, enabled: true },
+    ],
+  }, null, 2));
+  const proxy = await startProxy({
+    upstreamPort: intl.port, cwd: workdir,
+    env: { WB_EXIT1_REALM: 'intl', WB_EXIT2_PORT: String(exit2), WB_EXIT2_REALM: 'cn' },
+  });
+  const exit2Base = `http://127.0.0.1:${exit2}`;
+  t.after(async () => {
+    await proxy.kill();
+    await Promise.all([intl.close(), cn.close()]);
+    try { rmSync(workdir, { recursive: true, force: true }); } catch {}
+  });
+
+  await t.test('主端口只打国际版出口', async () => {
+    await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
+    assert.equal(intl.seen.length, 1);
+    assert.equal(cn.seen.length, 0);
+    assert.equal(intl.seen[0].headers['x-realm'], 'intl');
+  });
+
+  await t.test('第二个端口只打国内版出口', async () => {
+    const r = await fetch(`${exit2Base}/wb/v1/chat/completions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [] }),
+    });
+    assert.equal(r.status, 200);
+    assert.equal(cn.seen.length, 1);
+    assert.equal(intl.seen.length, 1, '国际版出口不该被第二个端口碰到');
+    assert.equal(cn.seen[0].headers['x-realm'], 'cn');
+  });
+
+  await t.test('第二个端口是专用通道：非 /wb 路径 404', async () => {
+    const r = await fetch(`${exit2Base}/admin/api/keys`);
+    assert.equal(r.status, 404);
+    const h = await fetch(`${exit2Base}/health`);
+    assert.equal(h.status, 200);
+  });
+
+  await t.test('接口回报端口 → 版本的映射', async () => {
+    const v = await (await proxy.get('/admin/api/wb/channels')).json();
+    assert.deepEqual(v.exits.map((e) => e.realm), ['intl', 'cn']);
+    assert.equal(v.channels.find((c) => c.realm === 'cn').port, exit2);
   });
 });

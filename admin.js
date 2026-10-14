@@ -2322,7 +2322,7 @@
       const res = await api('/admin/api/wb/channels');
       state.wbChannels = res.channels || [];
       state.wbBreaker = res.breaker || null;
-      state.wbChannelMeta = { implicit: !!res.implicit, hubUrl: res.hubUrl };
+      state.wbChannelMeta = { implicit: !!res.implicit, hubUrl: res.hubUrl, exits: res.exits || [] };
       renderWbChannels();
       fillWbBreakerForm();
       renderTabBadges();
@@ -2345,6 +2345,18 @@
     if (!list) return;
     const empty = $('#wbChEmpty');
     const chans = state.wbChannels || [];
+
+    // 端口 → 版本：站点渠道就是照这个配 base_url 的，先把它摆在最上面
+    const exitsEl = $('#wbChExits');
+    if (exitsEl) {
+      const ex = state.wbChannelMeta?.exits || [];
+      exitsEl.innerHTML = ex.map((e) => {
+        const c = chans.find((x) => x.realm === e.realm);
+        const state2 = !c ? '未配置出口' : (!c.enabled ? '已停用' : (c.breakerActive ? '熔断中' : '正常'));
+        return `<div class="wb-fact${c && (c.breakerActive || !c.enabled) ? ' bad' : ''}"><span>${wbRealmLabel(e.realm)} · 端口 ${e.port}</span><b>${state2}</b></div>`;
+      }).join('');
+    }
+
     if (!chans.length) {
       list.innerHTML = '';
       if (empty) empty.classList.remove('hidden');
@@ -2366,7 +2378,7 @@
             <span class="wb-dot ${st.cls}" aria-hidden="true"></span>
             <div class="wb-card-title">
               <b>${escapeHtml(c.name)}</b>
-              <small>${wbRealmLabel(c.realm)} · ${c.hubUrl ? escapeHtml(c.hubUrl) : '默认 hub'}</small>
+              <small>${wbRealmLabel(c.realm)} · 端口 ${c.port || '—'} · ${c.hubUrl ? escapeHtml(c.hubUrl) : '默认 hub'}</small>
             </div>
             <div class="wb-card-tags">
               <span class="wb-chip ${st.cls}">${st.text}</span>

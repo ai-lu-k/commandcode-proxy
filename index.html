@@ -134,7 +134,7 @@
             </button>
             <button class="side-item" type="button" data-view="wb/channels">
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-route"/></svg>
-              <span>渠道与熔断</span>
+              <span>出口与熔断</span>
               <b class="side-count side-count-alert" id="tabWbBreakerCount" hidden>0</b>
             </button>
             <button class="side-item" type="button" data-view="wb/usage">
@@ -831,8 +831,8 @@
                 <div class="panel-title">
                   <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-route"/></svg></span>
                   <div>
-                    <h2>渠道池</h2>
-                    <p class="hint">站点渠道打的 <code>/wb/v1/*</code> 在这些渠道之间轮询：先把某个模型的请求筛到版本对得上的渠道，再按优先级 → 权重分流量。某条最近多数请求首字超过阈值，就判定「一直很慢」自动摘掉一段，到点放回来做一次探测；<b>手动停用是绝对的</b>，不会被自动逻辑覆盖。</p>
+                    <h2>出口池</h2>
+                    <p class="hint">WorkBuddy 的国际版与国内版装在不同端口上：站点各开一个渠道（一个 base_url 一个端口）就能同时用两边，分流交给站点；<b>每个出口内部由 hub 自己的账号池做负载均衡</b>。这里只负责把出口版本钉对、盯健康度、以及在某个出口一直很慢时自动摘掉它 —— 摘掉后该端口的请求会失败，站点渠道会自动换到另一个端口。</p>
                   </div>
                 </div>
                 <div class="panel-tools">
@@ -842,6 +842,7 @@
                   </button>
                 </div>
               </div>
+              <div class="wb-facts" id="wbChExits"></div>
               <div id="wbChList" class="wb-channels"></div>
               <p id="wbChEmpty" class="empty hidden">
                 <span class="empty-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-inbox"/></svg></span>
@@ -857,8 +858,8 @@
                 <div class="panel-title">
                   <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-plus"/></svg></span>
                   <div>
-                    <h2>新增渠道</h2>
-                    <p class="hint">优先级高的先用；同优先级按权重分。想「先用免费的国际版，慢到熔断再退到国内版」，就把国际版优先级调高。</p>
+                    <h2>新增出口</h2>
+                    <p class="hint">一个出口 = 一个 hub + 一个版本 + 一个端口。同一版本配多条时，它们之间按优先级 → 权重分流量。</p>
                   </div>
                 </div>
               </div>
