@@ -1766,6 +1766,91 @@ input:disabled { opacity: 0.6; }
   .sidebar::-webkit-scrollbar { display: none; }
 }
 
+/* ── WorkBuddy 用量视图 ────────────────────────────────── */
+.wb-summary { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 16px 0; }
+.wb-usage-empty { margin: 0; padding: 26px 16px; text-align: center; font-size: 12.5px; color: var(--faint); }
+
+.wb-days {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 16px;
+  min-height: 190px;
+  overflow-x: auto;
+}
+.wb-day { flex: 1 1 0; min-width: 44px; max-width: 84px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.wb-day b {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.wb-day-track {
+  width: 100%;
+  height: 118px;
+  display: flex;
+  align-items: flex-end;
+  border-radius: 6px;
+  background: var(--track);
+  overflow: hidden;
+}
+.wb-day-track i {
+  display: block;
+  width: 100%;
+  border-radius: 6px 6px 0 0;
+  background: linear-gradient(180deg, var(--accent-3), var(--accent-2));
+  transition: height .3s ease;
+}
+.wb-day span { font-size: 11px; color: var(--faint); white-space: nowrap; }
+.wb-day:hover b { color: var(--ink); }
+.wb-day:hover .wb-day-track i { filter: brightness(1.2); }
+
+.wb-utable { display: flex; flex-direction: column; }
+.wb-uhead,
+.wb-urow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) repeat(6, minmax(0, 1fr));
+  gap: 10px;
+  align-items: center;
+  padding: 9px 16px;
+}
+.wb-uhead { font-size: 11px; color: var(--faint); border-bottom: 1px solid var(--line); }
+.wb-uhead > span:not(:first-child) { text-align: right; }
+.wb-urow { border-bottom: 1px solid var(--line); }
+.wb-urow:last-child { border-bottom: 0; }
+.wb-ucell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-end;
+  text-align: right;
+}
+.wb-ucell b {
+  font-size: 12.5px;
+  color: var(--ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.wb-ucell small { font-size: 10.5px; color: var(--faint); white-space: nowrap; }
+.wb-ucell-name { align-items: flex-start; text-align: left; }
+.wb-ucell-name b { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.wb-facts-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+@media (max-width: 980px) {
+  .wb-uhead,
+  .wb-urow { grid-template-columns: minmax(0, 1.5fr) repeat(3, minmax(0, 1fr)); }
+  .wb-uhead > span:nth-child(n+5),
+  .wb-urow .wb-ucell:nth-child(n+5) { display: none; }
+}
+@media (max-width: 720px) {
+  .wb-uhead { display: none; }
+  .wb-urow { grid-template-columns: minmax(0, 1fr) repeat(2, minmax(0, 1fr)); }
+  .wb-urow .wb-ucell:nth-child(n+4) { display: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.001ms !important;

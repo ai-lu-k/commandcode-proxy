@@ -578,6 +578,7 @@
     // 只要进了某个数据源，就把它那套 KPI 刷新一遍（两套 KPI 不再共用一块）
     if (source === 'wb') refreshWorkbuddy();
     if (v === 'wb/schedule') refreshWbSchedule();
+    if (v === 'wb/usage') refreshWbUsage();
   }
 
   function initialView() {
@@ -1531,6 +1532,10 @@
      数据全部来自服务端 /admin/api/workbuddy/*：那里替我们登录 hub 面板并持会话令牌，
      浏览器不接触面板密码，也不用关心 hub 的绝对路径。 */
   const WB_REALM_TEXT = { intl: '🌐 国际版', cn: '🇨🇳 国内版' };
+  // hub 的 range_window 只认 today / week / month / custom —— 刻意没有 7d / 30d 这类
+  // 滚动别名（"最近七天"和"本周"是不同窗口，按钮标签会在七天里错六天）。
+  // 'all' 是我们自己的意思：不传 range，拿全部历史。
+  const WB_RANGE_TEXT = { today: '今天', week: '本周', month: '本月', all: '全部' };
   let wbLoginState = null;
   let wbLoginTimer = null;
   let wbFetching = false;
@@ -1598,6 +1603,21 @@
     const v = Number(n);
     if (!isFinite(v)) return '—';
     return v.toLocaleString('zh-CN', { maximumFractionDigits: digits });
+  }
+  /** token 一屏就是 1.8 亿，全写出来没法看，按中文习惯压成「亿 / 万」 */
+  function wbCompact(n) {
+    const v = Number(n) || 0;
+    if (v >= 1e8) return (v / 1e8).toFixed(2) + ' 亿';
+    if (v >= 1e4) return (v / 1e4).toFixed(1) + ' 万';
+    return String(Math.round(v));
+  }
+  /** 时间范围的查询串；'all' 表示不传 range —— 不传就是全部历史 */
+  function wbRangeQuery(extra = '') {
+    const range = state.wb?.range || 'today';
+    const parts = [];
+    if (range !== 'all') parts.push('range=' + encodeURIComponent(range));
+    if (extra) parts.push(extra);
+    return parts.length ? '?' + parts.join('&') : '';
   }
   function wbExpiry(a) {
     if (a.expiresIn) return String(a.expiresIn);
@@ -1744,18 +1764,23 @@
       creditsSub.textContent = n != null ? `${n} 个积分包` : '上游只读快照';
     }
 
+    const rangeLabel = WB_RANGE_TEXT[state.wb?.range || 'today'] || '';
+
     const reqs = $('#wbStatReqs');
     if (reqs) reqs.textContent = `${wbNum(win.requests ?? 0, 0)} / ${wbNum(all.requests ?? 0, 0)}`;
     const reqsSub = $('#wbStatReqsSub');
-    if (reqsSub) reqsSub.textContent = `窗口错误 ${wbNum(win.errors ?? 0, 0)}`;
+    if (reqsSub) {
+      reqsSub.textContent = `${rangeLabel} · 累计 ${wbNum(all.requests ?? 0, 0)}`
+        + (win.errors ? ` · 错误 ${wbNum(win.errors, 0)}` : '');
+    }
 
     const toks = $('#wbStatTokens');
-    if (toks) toks.textContent = `${wbNum(win.total_tokens ?? 0, 0)} / ${wbNum(all.total_tokens ?? 0, 0)}`;
+    if (toks) toks.textContent = `${wbCompact(win.total_tokens ?? 0)} / ${wbCompact(all.total_tokens ?? 0)}`;
     const toksSub = $('#wbStatTokensSub');
     if (toksSub) {
       toksSub.textContent = all.cost_cny
-        ? `累计 ¥${wbNum(all.cost_cny)}`
-        : (all.cache_hit_pct ? `缓存命中 ${wbNum(all.cache_hit_pct, 1)}%` : '窗口 / 累计');
+        ? `${rangeLabel} · 累计 ¥${wbNum(all.cost_cny)}`
+        : `${rangeLabel} · 缓存命中 ${wbNum(all.cache_hit_pct, 1)}%`;
     }
   }
 
@@ -1780,7 +1805,7 @@
         if (hint) hint.textContent = '账号列表读取失败：' + e.message;
       }
       // 这两个只影响汇总数字，失败了不该把整页拖黑
-      try { state.wb.analytics = await api('/admin/api/workbuddy/analytics'); } catch { state.wb.analytics = null; }
+      try { state.wb.analytics = await api('/admin/api/workbuddy/analytics' + wbRangeQuery()); } catch { state.wb.analytics = null; }
       try { state.wb.grants = await api('/admin/api/workbuddy/grants'); } catch { state.wb.grants = null; }
       renderWbKpis();
       renderWbAccounts();
@@ -1791,6 +1816,152 @@
       wbFetching = false;
     }
   }
+
+  /* ── WorkBuddy 用量 ────────────────────────────────────────
+     数据来自 hub 的用量日志：/usage/analytics 出汇总与分账号，/usage/timeseries
+     按天分桶出柱状。时间范围只认 today/week/month，'全部' 就是不传 range。 */
+
+  let wbUsageFetching = false;
+
+  function wbSetRangeActive() {
+    const range = state.wb?.range || 'today';
+    $$('#wbRangeSeg .seg').forEach((b) => b.classList.toggle('is-active', b.dataset.range === range));
+  }
+
+  function renderWbUsageSummary(an) {
+    const el = $('#wbUsageSummary');
+    if (!el) return;
+    const w = an?.summary?.window || {};
+    const range = state.wb?.range || 'today';
+    const since = an?.window?.since ? fmtTime(an.window.since * 1000) : null;
+    const chips = [
+      `<span class="wb-chip">${escapeHtml(WB_RANGE_TEXT[range] || range)}${since ? ' · 自 ' + escapeHtml(since) : ''}</span>`,
+      `<span class="wb-chip">${wbNum(w.requests, 0)} 请求</span>`,
+      `<span class="wb-chip">${escapeHtml(wbCompact(w.total_tokens))} token</span>`,
+      `<span class="wb-chip">¥${wbNum(w.cost_cny)}</span>`,
+      `<span class="wb-chip">缓存命中 ${wbNum(w.cache_hit_pct, 1)}%</span>`,
+      `<span class="wb-chip">首字 ${wbNum((w.ttft_ms_avg || 0) / 1000, 1)}s · ${wbNum(w.speed_avg, 1)} tok/s</span>`,
+    ];
+    if (w.errors) chips.push(`<span class="wb-chip bad">${wbNum(w.errors, 0)} 错误</span>`);
+    el.innerHTML = chips.join('');
+  }
+
+  function renderWbDailyBars(ts) {
+    const el = $('#wbDailyBars');
+    if (!el) return;
+    const series = Array.isArray(ts?.series) ? ts.series : [];
+    if (!series.length) {
+      el.innerHTML = '<p class="wb-usage-empty">这个范围内还没有请求。</p>';
+      return;
+    }
+    // 柱高按 token 算（这才是「用量」），请求数与缓存数放柱顶和 title
+    const max = Math.max(...series.map((s) => Number(s.total_tokens) || 0), 1);
+    el.innerHTML = series.map((s) => {
+      const toks = Number(s.total_tokens) || 0;
+      const h = Math.max(2, Math.round((toks / max) * 100));
+      const d = new Date((Number(s.at) || 0) * 1000);
+      const label = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+      const title = `${label} · ${wbNum(s.requests, 0)} 请求 · ${wbCompact(toks)} token`
+        + `${s.errors ? ` · ${wbNum(s.errors, 0)} 错误` : ''} · ${wbCompact(s.cached_tokens)} 缓存`;
+      return `<div class="wb-day" title="${escapeHtml(title)}">
+          <b>${escapeHtml(wbCompact(toks))}</b>
+          <div class="wb-day-track"><i style="height:${h}%"></i></div>
+          <span>${label}</span>
+        </div>`;
+    }).join('');
+  }
+
+  function renderWbUsageRows(an) {
+    const el = $('#wbUsageRows');
+    if (!el) return;
+    const rows = (Array.isArray(an?.accounts) ? an.accounts : []).slice();
+    // 按窗口内 token 降序：真正在跑流量的排前面
+    rows.sort((a, b) => (Number(b.window?.total_tokens) || 0) - (Number(a.window?.total_tokens) || 0));
+    if (!rows.length) {
+      el.innerHTML = '<p class="wb-usage-empty">这个范围内还没有账号产生请求。</p>';
+      return;
+    }
+    el.innerHTML = rows.map((a) => {
+      const w = a.window || {};
+      const realm = WB_REALM_TEXT[a.realm] || a.realm || '—';
+      return `<div class="wb-urow">
+          <div class="wb-ucell wb-ucell-name">
+            <b>${escapeHtml(String(a.nickname || a.uid || '—'))}</b>
+            <small>${escapeHtml(realm)}</small>
+          </div>
+          <div class="wb-ucell"><b>${wbNum(w.requests, 0)}</b><small>${w.errors ? '错误 ' + wbNum(w.errors, 0) : '—'}</small></div>
+          <div class="wb-ucell"><b>${escapeHtml(wbCompact(w.total_tokens))}</b><small>${escapeHtml(wbCompact(w.cached_tokens))} 缓存</small></div>
+          <div class="wb-ucell"><b>¥${wbNum(w.cost_cny)}</b><small>${wbNum(w.credit)} 积分</small></div>
+          <div class="wb-ucell"><b>${wbNum(w.cache_hit_pct, 1)}%</b><small>命中</small></div>
+          <div class="wb-ucell"><b>${wbNum((w.ttft_ms_avg || 0) / 1000, 1)}s</b><small>首字</small></div>
+          <div class="wb-ucell"><b>${wbNum(w.speed_avg, 1)}</b><small>tok/s</small></div>
+        </div>`;
+    }).join('');
+  }
+
+  function renderWbAllTime(an) {
+    const el = $('#wbAllTimeFacts');
+    if (!el) return;
+    const a = an?.summary?.all_time || {};
+    const facts = [
+      ['请求数', wbNum(a.requests, 0)],
+      ['错误数', wbNum(a.errors, 0)],
+      ['Token', wbCompact(a.total_tokens)],
+      ['其中缓存读', wbCompact(a.cached_tokens)],
+      ['推理 token', wbCompact(a.reasoning_tokens)],
+      ['花费', a.cost_cny ? '¥' + wbNum(a.cost_cny) : '—'],
+      ['缓存命中', wbNum(a.cache_hit_pct, 1) + '%'],
+      ['平均速度', wbNum(a.speed_avg, 1) + ' tok/s'],
+    ];
+    el.innerHTML = facts.map(([k, v]) =>
+      `<div class="wb-fact"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`).join('');
+  }
+
+  function renderWbUsage() {
+    const an = state.wb?.analytics || null;
+    wbSetRangeActive();
+    renderWbUsageSummary(an);
+    renderWbDailyBars(state.wb?.timeseries || null);
+    renderWbUsageRows(an);
+    renderWbAllTime(an);
+  }
+
+  async function refreshWbUsage() {
+    if (wbUsageFetching) return;
+    wbUsageFetching = true;
+    state.wb = state.wb || {};
+    if (!state.wb.range) state.wb.range = 'today';
+    try {
+      const [an, ts] = await Promise.all([
+        api('/admin/api/workbuddy/analytics' + wbRangeQuery()),
+        // bucket=86400 → 按本地零点分桶。realm=all 必须显式传：timeseries 不带 realm
+        // 时只按全局开关那个区算，会和上面 analytics 的汇总数字对不上。
+        api('/admin/api/workbuddy/timeseries' + wbRangeQuery('bucket=86400&realm=all')),
+      ]);
+      state.wb.analytics = an;
+      state.wb.timeseries = ts;
+      renderWbUsage();
+      renderWbKpis();   // 顶部 KPI 跟着同一个范围走，免得两处口径打架
+    } catch (e) {
+      toast('用量读取失败：' + e.message, 'err');
+    } finally {
+      wbUsageFetching = false;
+    }
+  }
+
+  const wbRangeSeg = $('#wbRangeSeg');
+  if (wbRangeSeg) {
+    wbRangeSeg.addEventListener('click', (e) => {
+      const b = e.target.closest('.seg[data-range]');
+      if (!b) return;
+      state.wb = state.wb || {};
+      state.wb.range = b.dataset.range;
+      wbSetRangeActive();
+      refreshWbUsage();
+    });
+  }
+  const wbUsageRefreshBtn = $('#wbUsageRefresh');
+  if (wbUsageRefreshBtn) wbUsageRefreshBtn.addEventListener('click', () => refreshWbUsage());
 
   function wbCloseLogin() {
     if (wbLoginTimer) { clearInterval(wbLoginTimer); wbLoginTimer = null; }

@@ -34,6 +34,7 @@
     <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3.4 13h4.2l1.5 3h5.8l1.5-3h4.2"/><path d="M6.3 4.4h11.4l3.3 8.6v6.8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6.8Z"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 21.6s7.6-3.7 7.6-9.4V5.6L12 2.6 4.4 5.6v6.6c0 5.7 7.6 9.4 7.6 9.4Z"/><path d="m9.2 11.9 2 2 3.7-3.9"/></symbol>
     <symbol id="i-robot" viewBox="0 0 24 24"><rect x="4.2" y="7.6" width="15.6" height="11.6" rx="3.4"/><path d="M12 3.2v4.4"/><circle cx="12" cy="2.9" r="1.2"/><path d="M9.1 12.3v1.9M14.9 12.3v1.9"/><path d="M9.4 16.5h5.2"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M3.6 20.4h16.8"/><rect x="5" y="11.2" width="3.4" height="6.4" rx="1"/><rect x="10.3" y="6.4" width="3.4" height="11.2" rx="1"/><rect x="15.6" y="14" width="3.4" height="3.6" rx="1"/></symbol>
   </svg>
 
   <!-- ── 顶栏 ───────────────────────────────────────────────── -->
@@ -129,6 +130,10 @@
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-credits"/></svg>
               <span>账号池</span>
               <b class="side-count" id="tabWorkbuddyCount" hidden>0</b>
+            </button>
+            <button class="side-item" type="button" data-view="wb/usage">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-chart"/></svg>
+              <span>用量</span>
             </button>
             <button class="side-item" type="button" data-view="wb/schedule">
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-clock"/></svg>
@@ -806,6 +811,73 @@
                 </div>
               </div>
               <div id="wbLoginBox" class="wb-login"></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ══ WorkBuddy · 用量 ════════════════════════════════════ -->
+      <section class="view-panel" id="panel-wb-usage" data-view="wb/usage" role="tabpanel" aria-label="WorkBuddy · 用量" hidden>
+        <div class="layout">
+          <div class="col-main">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-chart"/></svg></span>
+                  <div>
+                    <h2>每日用量</h2>
+                    <p class="hint">按本地零点分桶的 token 消耗，来自 hub 的用量日志。鼠标悬停单根柱子看当天明细。</p>
+                  </div>
+                </div>
+                <div class="panel-tools">
+                  <div class="segmented" id="wbRangeSeg" role="group" aria-label="时间范围">
+                    <button class="seg" type="button" data-range="today">今天</button>
+                    <button class="seg" type="button" data-range="week">本周</button>
+                    <button class="seg" type="button" data-range="month">本月</button>
+                    <button class="seg" type="button" data-range="all">全部</button>
+                  </div>
+                  <button id="wbUsageRefresh" class="btn ghost sm" type="button">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                    <span class="btn-label">刷新</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="wb-summary" id="wbUsageSummary"></div>
+              <div class="wb-days" id="wbDailyBars"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+                  <div>
+                    <h2>分账号用量</h2>
+                    <p class="hint">同上范围，按 token 降序。花费是 hub 按上游实际计费折算的人民币。</p>
+                  </div>
+                </div>
+              </div>
+              <div class="wb-utable">
+                <div class="wb-uhead">
+                  <span>账号</span><span>请求</span><span>Token</span><span>花费</span><span>缓存命中</span><span>首字</span><span>速度</span>
+                </div>
+                <div id="wbUsageRows"></div>
+              </div>
+            </section>
+          </div>
+
+          <aside class="side">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
+                  <div>
+                    <h2>累计（全部时间）</h2>
+                    <p class="hint">不受上面时间范围影响，用作对比基线。</p>
+                  </div>
+                </div>
+              </div>
+              <div class="wb-facts wb-facts-col" id="wbAllTimeFacts"></div>
             </section>
           </aside>
         </div>

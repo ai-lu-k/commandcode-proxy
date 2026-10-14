@@ -4943,6 +4943,7 @@ const WB_FORWARD = {
   // 且没有 TTL 缓存。只能由用户显式点「刷新额度」触发，绝不能挂在页面刷新路径上。
   '/workbuddy/credits': '/accounts/credits',
   '/workbuddy/analytics': '/usage/analytics',
+  '/workbuddy/timeseries': '/usage/timeseries',
   '/workbuddy/remaining': '/usage/remaining',
   '/workbuddy/schedule': '/scheduler',
   '/workbuddy/schedule/trigger': '/scheduler/trigger',
