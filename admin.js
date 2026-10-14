@@ -578,6 +578,7 @@
     // 只要进了某个数据源，就把它那套 KPI 刷新一遍（两套 KPI 不再共用一块）
     if (source === 'wb') refreshWorkbuddy();
     if (v === 'wb/schedule') refreshWbSchedule();
+    if (v === 'wb/channels') refreshWbChannels();
     if (v === 'wb/usage') refreshWbUsage();
   }
 
@@ -637,6 +638,13 @@
     // WorkBuddy 调度标签：hub 的定时调度器开着就点个绿点
     const wbDot = $('#tabWbSchedDot');
     if (wbDot) wbDot.hidden = !state.wb?.sched?.enabled;
+    // 渠道标签：把「熔断中 / 被手动停用」的条数挂在上面，不用切过去就知道出事了
+    const brk = $('#tabWbBreakerCount');
+    if (brk) {
+      const n = (state.wbChannels || []).filter((c) => c.breakerActive || !c.enabled).length;
+      brk.textContent = String(n);
+      brk.hidden = !n;
+    }
   }
 
   /** 会话列表单独刷新（很轻，不动额度） */
@@ -1368,6 +1376,10 @@
     if (state.view === 'cc/alerts' && Date.now() - lastAlertFetch > 15000) {
       refreshAlertsSilent();
       renderAlerts();
+    }
+    // 停在渠道页时自动刷新：熔断与首字延迟是活的，5s 一轮才看得出「正在被摘掉」
+    if (state.view === 'wb/channels' && Date.now() - lastWbChFetch > 5000) {
+      refreshWbChannels();
     }
   }, 1000);
 
@@ -2287,6 +2299,205 @@
       await refreshWbSchedule();
     }
   });
+
+  /* ── WorkBuddy 渠道池：负载均衡 / 熔断 / 手动开关 ─────────────
+     /wb/v1/* 由服务端在渠道之间轮询，这里只做展示与手动干预：
+       · 「启用」是手动位，永远优先于自动熔断；手动停用连兜底都不给；
+       · 权重 / 优先级 / 开关改完立刻 PATCH，不用另存；
+       · 首字延迟与熔断状态来自服务端最近 20 次采样的滚动窗口。 */
+  let lastWbChFetch = 0;
+  const WB_BR_FIELDS = ['slowMs', 'window', 'slowCount', 'errorCount', 'openMs', 'maxOpenMs'];
+  // 复用上面账号池那份文案；它没有「空 = 跟随全局」这一档，这里补上
+  const wbRealmLabel = (r) => (r ? (WB_REALM_TEXT[r] || r) : '跟随 hub 全局开关');
+
+  function wbChState(ch) {
+    if (!ch.enabled) return { cls: 'off', text: '已停用' };
+    if (ch.breakerActive) return { cls: 'trip', text: '熔断中' };
+    return { cls: 'on', text: '在池' };
+  }
+
+  async function refreshWbChannels() {
+    lastWbChFetch = Date.now();
+    try {
+      const res = await api('/admin/api/wb/channels');
+      state.wbChannels = res.channels || [];
+      state.wbBreaker = res.breaker || null;
+      state.wbChannelMeta = { implicit: !!res.implicit, hubUrl: res.hubUrl };
+      renderWbChannels();
+      fillWbBreakerForm();
+      renderTabBadges();
+    } catch { /* 静默失败，下一轮再试 */ }
+  }
+
+  function fillWbBreakerForm() {
+    const b = state.wbBreaker;
+    if (!b) return;
+    const ids = { slowMs: '#wbBrSlowMs', window: '#wbBrWindow', slowCount: '#wbBrSlowCount', errorCount: '#wbBrErrorCount', openMs: '#wbBrOpenMs', maxOpenMs: '#wbBrMaxOpenMs' };
+    for (const k of WB_BR_FIELDS) {
+      const el = $(ids[k]);
+      // 正在编辑的那个框不要被后台刷新打断
+      if (el && document.activeElement !== el) el.value = b[k];
+    }
+  }
+
+  function renderWbChannels() {
+    const list = $('#wbChList');
+    if (!list) return;
+    const empty = $('#wbChEmpty');
+    const chans = state.wbChannels || [];
+    if (!chans.length) {
+      list.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+
+    list.innerHTML = chans.map((c) => {
+      const st = wbChState(c);
+      const s = c.stats || {};
+      const secs = (v) => (v == null ? '—' : (v < 1000 ? wbNum(v, 0) + 'ms' : wbNum(v / 1000, 1) + 's'));
+      const fact = (k, v, cls = '') => `<div class="wb-fact ${cls}"><span>${k}</span><b>${v}</b></div>`;
+      const trip = c.breakerActive
+        ? `<span class="wb-chip bad">${c.breaker?.reason === 'errors' ? '连续失败' : '一直很慢'} · 第 ${c.breaker?.strikes || 1} 次 · ${fmtClock(c.breaker?.until)} 放回</span>`
+        : (c.breaker ? `<span class="wb-chip">上次熔断 ${fmtClock(c.breaker.at)}</span>` : '');
+      return `
+        <article class="wb-card wb-ch" data-id="${escapeHtml(c.id)}">
+          <div class="wb-card-head">
+            <span class="wb-dot ${st.cls}" aria-hidden="true"></span>
+            <div class="wb-card-title">
+              <b>${escapeHtml(c.name)}</b>
+              <small>${wbRealmLabel(c.realm)} · ${c.hubUrl ? escapeHtml(c.hubUrl) : '默认 hub'}</small>
+            </div>
+            <div class="wb-card-tags">
+              <span class="wb-chip ${st.cls}">${st.text}</span>
+              ${trip}
+              ${s.lastError ? `<span class="wb-chip bad">${escapeHtml(s.lastError)}</span>` : ''}
+            </div>
+            <div class="wb-ch-acts">
+              <label class="wb-switch" title="手动开关；停用后连兜底都不会被选中">
+                <input type="checkbox" data-act="enabled" ${c.enabled ? 'checked' : ''} />
+                <span>启用</span>
+              </label>
+              <label class="wb-num">权重<input type="number" min="1" step="1" data-act="weight" value="${c.weight}" /></label>
+              <label class="wb-num">优先级<input type="number" step="1" data-act="priority" value="${c.priority}" /></label>
+              <button class="btn ghost sm" type="button" data-act="test">探活</button>
+              <button class="btn ghost sm" type="button" data-act="reset" ${c.breaker ? '' : 'disabled'}>重置熔断</button>
+              <button class="btn ghost sm danger" type="button" data-act="del">删除</button>
+            </div>
+          </div>
+          <div class="wb-facts">
+            ${fact('平均首字', secs(s.avgTtfbMs))}
+            ${fact('中位首字', secs(s.p50TtfbMs))}
+            ${fact('最近一次', secs(s.lastTtfbMs))}
+            ${fact('采样', wbNum(s.samples, 0))}
+            ${fact('慢/错', `${wbNum(s.slowCount, 0)} / ${wbNum(s.errorCount, 0)}`, (s.errorCount ? 'bad' : ''))}
+          </div>
+        </article>`;
+    }).join('');
+  }
+
+  function wbChPatch(id, body, okMsg) {
+    return api(`/admin/api/wb/channels/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: JSON.stringify(body),
+    }).then(async (r) => {
+      if (okMsg) toast(okMsg);
+      await refreshWbChannels();
+      return r;
+    }).catch(async (e) => {
+      toast('改不动：' + e.message, 'err');
+      await refreshWbChannels();
+    });
+  }
+
+  const wbChListEl = $('#wbChList');
+  if (wbChListEl) {
+    wbChListEl.addEventListener('change', (e) => {
+      const el = e.target.closest('[data-act]');
+      const card = e.target.closest('[data-id]');
+      if (!el || !card) return;
+      const id = card.dataset.id;
+      if (el.dataset.act === 'enabled') wbChPatch(id, { enabled: el.checked }, el.checked ? '已启用' : '已停用');
+      if (el.dataset.act === 'weight') wbChPatch(id, { weight: Math.max(1, Number(el.value) || 1) });
+      if (el.dataset.act === 'priority') wbChPatch(id, { priority: Number(el.value) || 0 });
+    });
+    wbChListEl.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button[data-act]');
+      const card = e.target.closest('[data-id]');
+      if (!btn || !card) return;
+      const id = card.dataset.id;
+      const name = card.querySelector('.wb-card-title b')?.textContent || id;
+      if (btn.dataset.act === 'reset') {
+        try {
+          await api(`/admin/api/wb/channels/${encodeURIComponent(id)}/reset`, { method: 'POST', body: '{}' });
+          toast('熔断记录已清空，权重序列恢复');
+        } catch (err) { toast('重置失败：' + err.message, 'err'); }
+        return refreshWbChannels();
+      }
+      if (btn.dataset.act === 'test') {
+        btn.disabled = true;
+        try {
+          const r = await api(`/admin/api/wb/channels/${encodeURIComponent(id)}/test`, { method: 'POST', body: '{}' });
+          toast(r.ok ? `「${name}」可达，出口 ${r.realm || '未标注'}，${r.models ?? '?'} 个模型，${r.ms}ms`
+            : `「${name}」不可达：${r.error || r.status}`);
+        } catch (err) { toast('探活失败：' + err.message, 'err'); }
+        btn.disabled = false;
+        return;
+      }
+      if (btn.dataset.act === 'del') {
+        if (!window.confirm(`删除渠道「${name}」？它的权重与熔断记录都会丢掉。`)) return;
+        try {
+          await api(`/admin/api/wb/channels/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          toast('已删除');
+        } catch (err) { toast('删除失败：' + err.message, 'err'); }
+        return refreshWbChannels();
+      }
+    });
+  }
+
+  const wbChForm = $('#wbChForm');
+  if (wbChForm) {
+    wbChForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const payload = {
+        name: $('#wbChName').value.trim(),
+        realm: $('#wbChRealm').value,
+        hubUrl: $('#wbChHubUrl').value.trim(),
+        weight: Math.max(1, Number($('#wbChWeight').value) || 1),
+        priority: Number($('#wbChPriority').value) || 0,
+      };
+      if (!payload.name) return toast('先起个名字', 'err');
+      try {
+        await api('/admin/api/wb/channels', { method: 'POST', body: JSON.stringify(payload) });
+        toast(`已添加「${payload.name}」`);
+        wbChForm.reset();
+        $('#wbChWeight').value = '1';
+        $('#wbChPriority').value = '0';
+      } catch (err) { toast('添加失败：' + err.message, 'err'); }
+      refreshWbChannels();
+    });
+  }
+
+  const wbChBreakerForm = $('#wbChBreakerForm');
+  if (wbChBreakerForm) {
+    wbChBreakerForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const body = {};
+      const map = { slowMs: '#wbBrSlowMs', window: '#wbBrWindow', slowCount: '#wbBrSlowCount', errorCount: '#wbBrErrorCount', openMs: '#wbBrOpenMs', maxOpenMs: '#wbBrMaxOpenMs' };
+      for (const k of WB_BR_FIELDS) {
+        const v = Number($(map[k]).value);
+        if (Number.isFinite(v) && v > 0) body[k] = v;
+      }
+      try {
+        const r = await api('/admin/api/wb/breaker', { method: 'PUT', body: JSON.stringify(body) });
+        state.wbBreaker = r.breaker;
+        toast('阈值已保存');
+      } catch (err) { toast('保存失败：' + err.message, 'err'); }
+      refreshWbChannels();
+    });
+  }
+
+  const wbChRefreshBtn = $('#wbChRefresh');
+  if (wbChRefreshBtn) wbChRefreshBtn.addEventListener('click', () => refreshWbChannels());
 
   // 点击卡片空白处不触发任何操作，但 Enter 在按钮上由浏览器原生处理
   setView(initialView(), { save: false });

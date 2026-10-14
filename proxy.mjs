@@ -38,6 +38,21 @@ const WB_DEFAULTS = {
   hubApiKey: '',
   upstreamUrl: 'http://127.0.0.1:7863',
   managerUrl: 'http://127.0.0.1:7864',
+  // ── 渠道池熔断 ─────────────────────────────────
+  // 一个 hub 有多个出口（realm）时，/wb/v1/* 在多条渠道之间加权轮询；某条渠道
+  // 「一直很慢」就自动摘掉一段时间，到点放回来。渠道本体在 keys.json 的
+  // wbChannels 里（前端可增删改），这里只是判定阈值。
+  //
+  // 注意 breakerSlowMs 要按基线给：国际版实测首字中位 22s、p90 57s（大上下文
+  // prefill + 上游频率限制），阈值设 20s 会把国际版永久摘掉 —— 那是配置，不是
+  // 熔断。默认 30s，前端能改。
+  breakerSlowMs: 30000,      // 首字超过它算一次「慢」
+  breakerWindow: 6,          // 看最近几次采样
+  breakerSlowCount: 4,       // 其中几次算慢 → 判定「一直很慢」
+  breakerErrorCount: 4,      // 或最近几次连续失败 → 判定「一直不可用」
+  breakerOpenMs: 180000,     // 第一次摘掉 3 分钟
+  breakerMaxOpenMs: 1800000, // 反复熔断时最长摘掉 30 分钟
+  channels: [],              // 空 = 只有隐式默认渠道（保持接入前的行为）
 };
 
 function loadConfig() {
@@ -155,6 +170,7 @@ let keyStore = {
   lb: { ...LB_DEFAULTS },
   settings: { ...SETTINGS_DEFAULTS },
   keys: [],
+  wbChannels: [],
 };
 /** 会话 → Key 绑定（会话粘性模式的核心状态，仅内存，重启后按需重建） */
 const sessionRoutes = new Map(); // sessionId → { keyId, boundAt, lastAt, failures, moved }
@@ -231,6 +247,10 @@ function loadKeyStore() {
         : null,
       credits: k.credits && typeof k.credits === 'object' ? k.credits : null,
     }));
+    // WorkBuddy 渠道池跟 Key 池同住一个文件：同一把原子写、同一套 BOM/损坏兜底，
+    // 也不用再多一个挂载点（容器重建只挂 data 卷）。
+    keyStore.wbChannels = normalizeWbChannels(raw?.wbChannels);
+    keyStore.wbBreaker = normalizeWbBreaker(raw?.wbBreaker);
     sessionRoutes.clear();
   } catch (e) {
     // 读不出来时必须留证据：把原文件挪到一边，否则之后的任何一次保存
@@ -248,6 +268,8 @@ function loadKeyStore() {
       lb: { ...LB_DEFAULTS },
       settings: normalizeSettings(),
       keys: [],
+      wbChannels: [],
+      wbBreaker: {},
     };
   }
 }
@@ -260,6 +282,8 @@ function saveKeyStore() {
     lb: keyStore.lb,
     settings: keyStore.settings,
     keys: keyStore.keys,
+    wbChannels: keyStore.wbChannels || [],
+    wbBreaker: keyStore.wbBreaker || {},
   }, null, 2), 'utf-8');
   renameSync(tmp, KEYS_PATH);
 }
@@ -5038,6 +5062,228 @@ async function wbReadRawBody(req) {
   return Buffer.concat(chunks);
 }
 
+/* ── WorkBuddy 渠道池（多出口负载均衡 + 慢则熔断） ──────────────
+   一个 hub 底下有多个出口（国际版 intl / 国内版 cn / 以后可能更多主机），
+   /wb/v1/* 在它们之间按 priority → weight 加权轮询，并记录每条的首字延迟：
+
+     · 某条渠道最近 N 次里有多数「首字超过阈值」→ 判定「一直很慢」，摘掉一段
+       时间（反复熔断则越摘越久），到点自动放回来做一次探测。
+     · 前端可以手动停用/启用/重置 —— 手动开关与熔断是两个独立状态位，
+       手动停用永远优先，手动启用会清掉熔断计数。
+     · 池子里一条都没配时，退回接入前的行为：单条隐式渠道，打 hub 默认出口。
+
+   为什么把渠道放在这里而不是 new-api：站点渠道只认一个 base_url，加渠道要改
+   new-api 的表；而「哪个后端慢」这件事只有真正转发的地方看得见。 */
+
+const WB_RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
+// 模型只在某一版提供（跟 hub 的 exclusive_realm 保持一致）。渠道钉了 realm 时
+// 靠它做预筛，否则 hub 会回一个 400「只在国际版提供」。
+const WB_INTL_ONLY = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+  'gpt-5.5', 'gpt-5.4', 'gpt-5.3-codex', 'gemini-3.5-flash', 'grok-4.7'];
+const WB_CN_ONLY = ['deepseek-v4-pro', 'glm-5.1', 'glm-5v-turbo', 'kimi-k3-1', 'kimi-k2.7',
+  'minimax-m3', 'hy3-x', 'hy4-preview-dev', 'hy4-preview-x', 'space-bunny'];
+const WB_INTL_PREFIXES = ['gpt-', 'gemini-'];
+const WB_CN_PREFIXES = ['minimax-', 'deepseek-v4-pro'];
+
+const wbChannelStats = new Map();   // id -> { samples, cursor, lastError }（纯运行时）
+
+function newWbChannelId() {
+  return 'wb' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+}
+
+function normalizeWbChannels(raw) {
+  const out = [];
+  for (const c of (Array.isArray(raw) ? raw : [])) {
+    if (!c || typeof c !== 'object') continue;
+    const name = String(c.name || '').trim();
+    if (!name) continue;
+    const realm = String(c.realm || '').trim().toLowerCase();
+    out.push({
+      id: String(c.id || newWbChannelId()),
+      name,
+      // 留空 = 跟随 WB().hubUrl / WB().hubApiKey；填了就能指向另一台 hub。
+      hubUrl: String(c.hubUrl || '').trim(),
+      apiKey: String(c.apiKey || '').trim(),
+      realm: (realm === 'intl' || realm === 'cn') ? realm : '',
+      weight: Number.isFinite(+c.weight) ? Math.max(1, Math.floor(+c.weight)) : 1,
+      priority: Number.isFinite(+c.priority) ? +c.priority : 0,
+      enabled: c.enabled !== false,
+      note: String(c.note || '').trim(),
+      breaker: c.breaker && c.breaker.at
+        ? {
+            reason: String(c.breaker.reason || 'unknown'),
+            at: Number(c.breaker.at) || Date.now(),
+            until: Number(c.breaker.until) || 0,
+            strikes: Math.max(1, Number(c.breaker.strikes) || 1),
+          }
+        : null,
+    });
+  }
+  return out;
+}
+
+function wbChannelStat(id) {
+  let s = wbChannelStats.get(id);
+  if (!s) { s = { samples: [], cursor: 0, lastError: '' }; wbChannelStats.set(id, s); }
+  return s;
+}
+
+/** 模型属于哪一版；'' = 两版都有（不做 realm 预筛） */
+function wbModelRealm(model) {
+  const m = String(model || '').toLowerCase();
+  if (!m) return '';
+  if (WB_INTL_ONLY.includes(m) || WB_INTL_PREFIXES.some((p) => m.startsWith(p))) return 'intl';
+  if (WB_CN_ONLY.includes(m) || WB_CN_PREFIXES.some((p) => m.startsWith(p))) return 'cn';
+  return '';
+}
+
+function wbModelOfBody(body) {
+  if (!body || !body.length || body.length > 4 * 1024 * 1024) return '';
+  try { const j = JSON.parse(body.toString('utf-8')); return typeof j?.model === 'string' ? j.model : ''; } catch { return ''; }
+}
+
+function wbBreakerActive(ch, now = Date.now()) {
+  return !!(ch.breaker && ch.breaker.until > now);
+}
+
+/** 熔断阈值的持久层：面板能改，改了要活过重启，所以存在 keys.json 里 */
+function normalizeWbBreaker(raw) {
+  const num = (v) => (Number.isFinite(+v) ? +v : null);
+  const b = raw && typeof raw === 'object' ? raw : {};
+  const out = {};
+  for (const k of ['slowMs', 'window', 'slowCount', 'errorCount', 'openMs', 'maxOpenMs']) {
+    const v = num(b[k]);
+    if (v !== null && v > 0) out[k] = Math.floor(v);
+  }
+  return out;
+}
+
+/** 生效的熔断阈值：keys.json（面板改的）> config.json / 环境变量默认值 */
+function wbBreakerCfg() {
+  const d = WB();
+  const s = keyStore.wbBreaker || {};
+  const pick = (k, fb, min) => Math.max(min, Number.isFinite(+s[k]) ? +s[k] : (Number(d[fb]) || 0));
+  return {
+    slowMs: pick('slowMs', 'breakerSlowMs', 1000),
+    window: pick('window', 'breakerWindow', 2),
+    slowCount: pick('slowCount', 'breakerSlowCount', 1),
+    errorCount: pick('errorCount', 'breakerErrorCount', 1),
+    openMs: pick('openMs', 'breakerOpenMs', 1000),
+    maxOpenMs: pick('maxOpenMs', 'breakerMaxOpenMs', 1000),
+  };
+}
+
+/** 一轮熔断该摘多久：3 分钟起步，每多熔断一次翻倍，封顶 30 分钟 */
+function wbBreakerOpenMs(strikes, bcfg = wbBreakerCfg()) {
+  const base = bcfg.openMs;
+  const cap = Math.max(base, bcfg.maxOpenMs);
+  return Math.min(cap, base * Math.pow(2, Math.max(0, strikes - 1)));
+}
+
+/** 把一次转发结果记进采样窗口，必要时开关熔断。返回 true 表示状态变了需要落盘。 */
+function wbRecordSample(ch, sample) {
+  if (!ch) return false;
+  const st = wbChannelStat(ch.id);
+  st.samples.push(sample);
+  if (st.samples.length > 30) st.samples.shift();
+  if (!sample.ok && sample.status) st.lastError = `HTTP ${sample.status}`;
+  if (!sample.ok && !sample.status) st.lastError = sample.error || '网络错误';
+
+  const bcfg = wbBreakerCfg();
+  const win = bcfg.window;
+  const slowMs = bcfg.slowMs;
+  const needSlow = bcfg.slowCount;
+  const needErr = bcfg.errorCount;
+  const recent = st.samples.slice(-win);
+  const slow = recent.filter((s) => s.ok && s.ttfb > slowMs).length;
+  const errs = recent.filter((s) => !s.ok).length;
+
+  let changed = false;
+  const trip = (reason) => {
+    const strikes = (ch.breaker?.strikes || 0) + 1;
+    const open = wbBreakerOpenMs(strikes, bcfg);
+    ch.breaker = { reason, at: Date.now(), until: Date.now() + open, strikes };
+    log('warn', 'WorkBuddy 渠道熔断', {
+      channel: ch.name, reason, strikes, openSec: Math.round(open / 1000),
+      slowMs, slowCount: `${slow}/${recent.length}`, errorCount: `${errs}/${recent.length}`,
+    });
+    changed = true;
+  };
+
+  if (recent.length >= win && slow >= needSlow) {
+    if (!wbBreakerActive(ch)) trip('slow');
+  } else if (recent.length >= needErr && errs >= needErr) {
+    if (!wbBreakerActive(ch)) trip('errors');
+  } else if (ch.breaker && !wbBreakerActive(ch) && sample.ok && sample.ttfb <= slowMs) {
+    // 探测成功：把熔断记录连同 strikes 一起清掉，恢复原有的权重序列
+    ch.breaker = null;
+    changed = true;
+  }
+  return changed;
+}
+
+function wbChannelView(ch) {
+  const st = wbChannelStat(ch.id);
+  const bcfg = wbBreakerCfg();
+  const recent = st.samples.slice(-20);
+  const ttfts = recent.filter((s) => s.ok).map((s) => s.ttfb).sort((a, b) => a - b);
+  const avg = ttfts.length ? Math.round(ttfts.reduce((a, b) => a + b, 0) / ttfts.length) : null;
+  const p50 = ttfts.length ? ttfts[Math.floor(ttfts.length / 2)] : null;
+  return {
+    ...ch,
+    stats: {
+      samples: recent.length,
+      avgTtfbMs: avg,
+      p50TtfbMs: p50,
+      slowCount: recent.filter((s) => s.ok && s.ttfb > bcfg.slowMs).length,
+      errorCount: recent.filter((s) => !s.ok).length,
+      lastTtfbMs: recent.length ? recent[recent.length - 1].ttfb : null,
+      lastError: st.lastError,
+      lastAt: recent.length ? recent[recent.length - 1].at : null,
+    },
+    breakerActive: wbBreakerActive(ch),
+    eligible: ch.enabled && !wbBreakerActive(ch),
+  };
+}
+
+/** 本次请求的转发计划（有序、去重、最多 3 条）。
+ *
+ *  顺序：合得上 realm 且没被熔断的 → 优先级高的层在前 → 同层按本轮加权游标排。
+ *  熔断的渠道不排在最前，但**仍然留在计划末尾当兜底** ——「暂时关闭」是为了别把
+ *  慢的排在最前，不是为了在唯一健康的那条 429 时整站不可用。
+ *  手动停用则是绝对的：连兜底都不给（enabled=false 直接出池）。
+ */
+function wbPlan(model) {
+  const all = (keyStore.wbChannels || []).filter((c) => c.enabled);
+  if (!all.length) return [];
+  const owner = wbModelRealm(model);
+  let pool = all.filter((c) => !c.realm || !owner || owner === c.realm);
+  // 全被 realm 筛掉（渠道没配 realm 或配错了）：宁可试一把，让上游的「只在国际版
+  // 提供」暴出来，也不要在这里静默 503。
+  if (!pool.length) pool = all;
+  const alive = pool.filter((c) => !wbBreakerActive(c));
+  const base = alive.length ? alive : pool;
+  const top = Math.max(...base.map((c) => c.priority));
+  const tier = base.filter((c) => c.priority === top);
+  // 一次平滑加权轮询 tick：同层每条加自己的权重，最大者当主渠道，再扣掉总权重
+  let total = 0;
+  for (const c of tier) total += c.weight;
+  const ticks = tier.map((c) => ({ c, v: (wbChannelStat(c.id).cursor += c.weight) }));
+  ticks.sort((a, b) => b.v - a.v || String(a.c.id).localeCompare(String(b.c.id)));
+  wbChannelStat(ticks[0].c.id).cursor -= total;
+
+  const plan = ticks.map((t) => t.c);
+  for (const c of base) if (c.priority !== top) plan.push(c);
+  for (const c of all) if (!plan.includes(c)) plan.push(c);
+  return plan.slice(0, 3);
+}
+
+function wbCrossRealmError(text) {
+  const t = String(text || '');
+  return t.includes('只在国际版提供') || t.includes('只在国内版提供')
+    || t.includes('only available on the international') || t.includes('only available on the domestic');
+}
+
 /* ── WorkBuddy 对外出口 ────────────────────────────────────
    /wb/v1/* 原样转发到 hub 的 /v1/*，并把 hub 自己的 key 注进去（hub 只认自己的 key，
    调用方不必关心它）。
@@ -5050,39 +5296,119 @@ async function handleWorkbuddyEgress(req, res, url) {
     return sendJSON(res, 503, { error: { message: 'WorkBuddy 出口已关闭', type: 'server_busy' } });
   }
   // /wb/v1/chat/completions -> /v1/chat/completions
-  const target = `${cfg.hubUrl}${url.pathname.replace(/^\/wb/, '')}${url.search || ''}`;
+  const upstreamPath = url.pathname.replace(/^\/wb/, '');
+  const search = url.search || '';
 
-  const headers = {};
+  const baseHeaders = {};
   for (const h of ['content-type', 'accept', 'accept-language']) {
-    if (req.headers[h]) headers[h] = req.headers[h];
+    if (req.headers[h]) baseHeaders[h] = req.headers[h];
   }
-  if (cfg.hubApiKey) headers['Authorization'] = `Bearer ${cfg.hubApiKey}`;
 
   let body;
   if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
     body = await wbReadRawBody(req);
   }
 
-  const ac = new AbortController();
-  const onClose = () => ac.abort();
-  res.once('close', onClose);
-  try {
-    const upstream = await fetch(target, { method: req.method, headers, body, signal: ac.signal });
-    const out = { 'Content-Type': upstream.headers.get('content-type') || 'application/json' };
-    const cc = upstream.headers.get('cache-control');
-    if (cc) out['Cache-Control'] = cc;
-    res.writeHead(upstream.status, out);
-    if (!upstream.body) { res.end(); return; }
-    for await (const chunk of upstream.body) {
-      // 下游写不动就等它 drain，别把上游读爆
-      if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+  const channels = keyStore.wbChannels || [];
+  const model = wbModelOfBody(body);
+  // 没配渠道池 = 接入前的行为：单条隐式渠道
+  const plan = channels.length ? wbPlan(model) : [null];
+  if (!plan.length) {
+    return sendJSON(res, 503, { error: { message: 'WorkBuddy 没有启用的渠道', type: 'server_busy' } });
+  }
+
+  let lastError = '';
+  let lastStatus = 0;
+  for (let i = 0; i < plan.length; i++) {
+    const ch = plan[i];
+    const target = `${(ch?.hubUrl || cfg.hubUrl)}${upstreamPath}${search}`;
+    const headers = { ...baseHeaders };
+    const apiKey = ch?.apiKey || cfg.hubApiKey;
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    // 渠道钉了出口就显式声明；hub 的优先级是 显式参数 > key 绑定 > X-Realm 头 > 全局开关。
+    if (ch?.realm) headers['X-Realm'] = ch.realm;
+
+    const ac = new AbortController();
+    const onClose = () => ac.abort();
+    res.once('close', onClose);
+    const t0 = Date.now();
+    let upstream = null;
+    try {
+      upstream = await fetch(target, { method: req.method, headers, body, signal: ac.signal });
+    } catch (e) {
+      res.removeListener('close', onClose);
+      if (ch) wbRecordSample(ch, { at: Date.now(), ttfb: Date.now() - t0, ok: false, status: 0, error: e.message });
+      lastError = 'WorkBuddy hub 不可达：' + e.message;
+      if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } return; }
+      continue;
     }
-    res.end();
-  } catch (e) {
-    if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } }
-    else sendJSON(res, 502, { error: { message: 'WorkBuddy hub 不可达：' + e.message, type: 'upstream_error' } });
-  } finally {
-    res.removeListener('close', onClose);
+    const ttfb = Date.now() - t0;
+    const canRetry = i < plan.length - 1;
+
+    // 失败先用下一条渠道顶，而不是把错误原样丢给客户端：站点只有一条 WorkBuddy
+    // 渠道，429/5xx 在客户端看来就是「这个模型坏了」。
+    let retry = WB_RETRY_STATUS.has(upstream.status);
+    let errorText = null;
+    if (upstream.status === 400 && canRetry) {
+      // 跨出口的错误是 400，只有读到 body 才知道它其实是「走错版本了」
+      errorText = await upstream.text().catch(() => '');
+      retry = wbCrossRealmError(errorText);
+    }
+    if (retry && canRetry) {
+      try { await upstream.body?.cancel(); } catch { /* 无所谓 */ }
+      res.removeListener('close', onClose);
+      if (ch) {
+        wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: upstream.status, error: `${upstream.status}` });
+      }
+      lastStatus = upstream.status;
+      log('warn', 'WorkBuddy 渠道失败，换下一条', {
+        channel: ch?.name || '默认', status: upstream.status, next: plan[i + 1]?.name || '默认',
+      });
+      continue;
+    }
+
+    try {
+      const out = { 'Content-Type': upstream.headers.get('content-type') || 'application/json' };
+      const cc = upstream.headers.get('cache-control');
+      if (cc) out['Cache-Control'] = cc;
+      res.writeHead(upstream.status, out);
+      if (errorText !== null) { res.end(errorText); }
+      else if (!upstream.body) { res.end(); }
+      else {
+        let total = 0;
+        for await (const chunk of upstream.body) {
+          // 下游写不动就等它 drain，别把上游读爆
+          total += chunk.length;
+          if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+        }
+        res.end();
+      }
+      if (ch) {
+        const ok = upstream.status < 400;
+        if (wbRecordSample(ch, {
+          at: Date.now(), ttfb, totalMs: Date.now() - t0, ok, status: upstream.status,
+        })) saveKeyStore();
+      }
+      return;
+    } catch (e) {
+      if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } }
+      else lastError = 'WorkBuddy hub 不可达：' + e.message;
+      if (ch && !res.headersSent) {
+        if (wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: 0, error: e.message })) saveKeyStore();
+      }
+      return;
+    } finally {
+      res.removeListener('close', onClose);
+    }
+  }
+
+  if (!res.headersSent) {
+    sendJSON(res, 502, {
+      error: {
+        message: lastError || `WorkBuddy 所有渠道都不可用（最后状态 ${lastStatus || '—'}）`,
+        type: 'upstream_error',
+      },
+    });
   }
 }
 
@@ -5259,6 +5585,108 @@ async function handleAdminApi(req, res, url) {
         settings: { ...keyStore.settings, alerts: alerts.maskedConfig() },
         creditsRefresh: creditsRefreshState(),
       });
+    }
+  }
+
+  /* ── WorkBuddy 渠道池：负载均衡 / 熔断 / 手动开关 ─────────────
+     渠道本体存在 keys.json 的 wbChannels 里（容器重建不丢），运行时采样只在
+     内存；熔断状态跟着渠道一起落盘，所以重启后不会把刚摘掉的慢渠道立刻放回来。 */
+  if (path === '/wb/channels') {
+    if (req.method === 'GET') {
+      return sendJSON(res, 200, {
+        channels: (keyStore.wbChannels || []).map(wbChannelView),
+        breaker: wbBreakerCfg(),
+        hubUrl: WB().hubUrl,
+        hubApiKeySet: !!WB().hubApiKey,
+        implicit: !(keyStore.wbChannels || []).length,   // 没配渠道 = 走隐式默认出口
+        serverTime: Date.now(),
+      });
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      const name = String(body.name || '').trim();
+      if (!name) return sendJSON(res, 400, { error: { message: 'name 必填', type: 'invalid_request_error' } });
+      const store = keyStore.wbChannels || [];
+      if (store.some((c) => c.name === name)) {
+        return sendJSON(res, 409, { error: { message: '渠道名已存在', type: 'conflict' } });
+      }
+      const entry = normalizeWbChannels([{ ...body, id: newWbChannelId(), name }])[0];
+      if (!entry) return sendJSON(res, 400, { error: { message: '渠道参数不合法', type: 'invalid_request_error' } });
+      keyStore.wbChannels = [...store, entry];
+      saveKeyStore();
+      wbChannelStat(entry.id);
+      return sendJSON(res, 201, wbChannelView(entry));
+    }
+  }
+
+  if (path === '/wb/breaker' && req.method === 'PUT') {
+    const body = await readJsonOr400(req, res);
+    if (!body) return;
+    keyStore.wbBreaker = normalizeWbBreaker({ ...wbBreakerCfg(), ...body });
+    saveKeyStore();
+    return sendJSON(res, 200, { breaker: wbBreakerCfg() });
+  }
+
+  const wbc = path.match(/^\/wb\/channels\/([A-Za-z0-9_-]+)(\/reset|\/test)?$/);
+  const wbEntry = wbc ? (keyStore.wbChannels || []).find((c) => c.id === wbc[1]) : null;
+  if (wbc && !wbEntry) {
+    return sendJSON(res, 404, { error: { message: '渠道不存在', type: 'not_found' } });
+  }
+  if (wbEntry) {
+    if (wbc[2] === '/reset' && req.method === 'POST') {
+      // 手动重置：熔断记录与采样窗口一起清，strikes 也归零
+      wbEntry.breaker = null;
+      wbChannelStat(wbEntry.id).samples = [];
+      wbChannelStat(wbEntry.id).cursor = 0;
+      saveKeyStore();
+      log('info', 'WorkBuddy 渠道熔断已手动重置', { channel: wbEntry.name });
+      return sendJSON(res, 200, wbChannelView(wbEntry));
+    }
+    if (wbc[2] === '/test' && req.method === 'POST') {
+      // 只打 hub 的 /v1/models：不消耗上游额度，又能验证「地址 + key + realm 声明」
+      // 这三件事是否真的生效（hub 会把最终生效的 realm 回在响应里）。
+      const base = wbEntry.hubUrl || WB().hubUrl;
+      const headers = {};
+      const apiKey = wbEntry.apiKey || WB().hubApiKey;
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+      if (wbEntry.realm) headers['X-Realm'] = wbEntry.realm;
+      const t0 = Date.now();
+      try {
+        const r = await wbFetchRaw(`${base}/v1/models`, { headers, timeoutMs: 8000 });
+        const ids = Array.isArray(r.data?.data) ? r.data.data.length : null;
+        return sendJSON(res, 200, {
+          ok: r.ok, status: r.status, ms: Date.now() - t0,
+          realm: r.data?.realm || '', models: ids,
+          error: r.ok ? '' : (r.data?.error?.message || r.data?.raw || ''),
+        });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, status: 0, ms: Date.now() - t0, error: e.message });
+      }
+    }
+    if (req.method === 'PATCH') {
+      const body = await readJsonOr400(req, res);
+      if (!body) return;
+      const merged = normalizeWbChannels([{ ...wbEntry, ...body, id: wbEntry.id }])[0];
+      if (!merged) return sendJSON(res, 400, { error: { message: '渠道参数不合法', type: 'invalid_request_error' } });
+      // 手动启用时顺手清掉熔断：操作者的意图优先于自动判定
+      if (body.enabled === true && body.keepBreaker !== true) {
+        merged.breaker = null;
+        wbChannelStat(merged.id).samples = [];
+      }
+      Object.assign(wbEntry, merged);
+      if ((keyStore.wbChannels || []).some((c) => c !== wbEntry && c.name === wbEntry.name)) {
+        return sendJSON(res, 409, { error: { message: '渠道名已存在', type: 'conflict' } });
+      }
+      saveKeyStore();
+      return sendJSON(res, 200, wbChannelView(wbEntry));
+    }
+    if (req.method === 'DELETE') {
+      keyStore.wbChannels = (keyStore.wbChannels || []).filter((c) => c.id !== wbEntry.id);
+      wbChannelStats.delete(wbEntry.id);
+      saveKeyStore();
+      res.writeHead(204);
+      return res.end();
     }
   }
 
