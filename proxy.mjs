@@ -59,6 +59,11 @@ function loadConfig() {
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
     adminUrl: '',                 // 告警邮件里附的管理台地址，如 https://ai.lu-k.cn/proxy/
     hostLabel: '',                // 告警邮件里的主机标识（留空用容器/机器主机名）
+    // 出口令牌（可选）。非空时 /v1/* 与 /wb/v1/* 必须带 Authorization: Bearer <key>
+    // 或 x-api-key: <key>，否则 401。**留空 = 不校验**（旧行为），所以配错了可以
+    // 立刻清掉环境变量回滚。CC 反代本来就不读 Authorization 头（只认 user_* 做
+    // BYOK，池内选取完全不看它），所以拿它当令牌不影响任何既有逻辑。
+    egressKeys: [],
     workbuddy: { ...WB_DEFAULTS }, // WorkBuddy 第二套上游，见上方 WB_DEFAULTS
   };
 
@@ -92,6 +97,11 @@ function loadConfig() {
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
   if (process.env.CC_ADMIN_URL) defaults.adminUrl = process.env.CC_ADMIN_URL;
   if (process.env.CC_HOST_LABEL) defaults.hostLabel = process.env.CC_HOST_LABEL;
+  // 出口令牌：支持逗号分隔多个，便于轮换（先加新的，再撤旧的）
+  const egressRaw = process.env.CC_EGRESS_KEYS || process.env.CC_EGRESS_KEY || '';
+  if (egressRaw.trim()) {
+    defaults.egressKeys = egressRaw.split(',').map((s) => s.trim()).filter(Boolean);
+  }
   if (process.env.WB_HUB_URL) defaults.workbuddy.hubUrl = process.env.WB_HUB_URL;
   if (process.env.WB_HUB_PANEL_PASSWORD) defaults.workbuddy.hubPanelPassword = process.env.WB_HUB_PANEL_PASSWORD;
   if (process.env.WB_HUB_API_KEY) defaults.workbuddy.hubApiKey = process.env.WB_HUB_API_KEY;
@@ -266,6 +276,26 @@ function extractClientApiKey(headers) {
     if (match) return match[0];
   }
   return null;
+}
+
+/** 出口令牌校验。
+    `CFG.egressKeys` 为空时一律放行 —— 这是刻意的：既保持旧行为，也让"配错令牌"
+    能靠清掉环境变量立刻回滚，而不是把生产链路锁死。
+    比较用定长，避免按字符提前返回。 */
+function egressKeyOk(req) {
+  const keys = Array.isArray(CFG.egressKeys)
+    ? CFG.egressKeys.filter((k) => typeof k === 'string' && k)
+    : [];
+  if (!keys.length) return true;
+  const auth = String(req.headers['authorization'] || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const supplied = bearer || String(req.headers['x-api-key'] || '').trim();
+  if (!supplied) return false;
+  const a = Buffer.from(supplied);
+  return keys.some((k) => {
+    const b = Buffer.from(k);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  });
 }
 
 function getFallbackApiKey() {
@@ -5368,8 +5398,26 @@ const server = http.createServer(async (req, res) => {
     || url.pathname === '/admin/'
     || url.pathname === '/admin.css'
     || url.pathname === '/admin.js';
-  if (!isLiveness && MAX_INFLIGHT > 0) {
-    if (inflightCount >= MAX_INFLIGHT) {
+
+  // 出口鉴权：只覆盖对外供模型的两条出口。管理台自己的 API（/admin/api/*）不走
+  // 这里 —— 它在公网侧由 nginx basic auth 挡着，而浏览器 UI 是同源调用，
+  // 没法带令牌。`CFG.egressKeys` 为空时整段直接放行。
+  const isEgress = url.pathname.startsWith('/v1/')
+    || url.pathname.startsWith('/provider/')
+    || url.pathname === '/wb/v1'
+    || url.pathname.startsWith('/wb/v1/');
+  if (isEgress && !egressKeyOk(req)) {
+    log('warn', 'Egress request rejected: missing or invalid egress key', {
+      path: url.pathname,
+      peer: req.socket?.remoteAddress,
+    });
+    sendJSON(res, 401, {
+      error: { message: 'missing or invalid egress key', type: 'invalid_request_error' },
+    });
+    return;
+  }
+
+  if (!isLiveness && MAX_INFLIGHT > 0) {    if (inflightCount >= MAX_INFLIGHT) {
       log('warn', 'In-flight limit reached, rejecting request', {
         maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
       });
