@@ -4905,11 +4905,10 @@ async function wbProbe(base, path) {
 
 /** 只读转发映射：面板路径 → hub 路径 */
 const WB_FORWARD = {
-  // 用 /accounts/credits 而不是 /accounts：前者同样的行，但每行多一个已填好的
-  // credits 对象（remain/size/used/percent/is_paid_user/packages…），后者里它是 null。
-  // 它是服务端的只读快照，不会每次轮询都去戳上游。
-  '/workbuddy/accounts': '/accounts/credits',
   '/workbuddy/grants': '/accounts/credits/grants',
+  // POST /accounts/credits 才是「真的去上游刷一遍额度」——每个账号一次计费请求，
+  // 且没有 TTL 缓存。只能由用户显式点「刷新额度」触发，绝不能挂在页面刷新路径上。
+  '/workbuddy/credits': '/accounts/credits',
   '/workbuddy/analytics': '/usage/analytics',
   '/workbuddy/remaining': '/usage/remaining',
   '/workbuddy/realm': '/realm',
@@ -4938,6 +4937,37 @@ async function handleWorkbuddy(req, res, path, url) {
       manager: { url: WB().managerUrl, ...manager },
       panelReady: !!WB().hubPanelPassword,
     });
+  }
+
+  // 账号池：/accounts 是按 realm 过滤的（不带 ?realm= 时用全局开关），所以想拿全部
+  // 账号就得两个 realm 各取一次再合并。
+  //
+  // 这里刻意**不用** /accounts/credits：那个端点看起来更合适（返回全部账号且 credits
+  // 已填好），但它会对每个账号调一次 fetch_credits()，而那个函数没有 TTL 缓存，直接
+  // 打上游计费接口 —— 挂在页面刷新路径上会随账号数线性放大，等于每次开个标签页就把
+  // 整池账号的计费接口刷一遍。
+  //
+  // /accounts 返回的 credits 是 hub 自己的后台刷新器（默认 12h）维护在账号对象上的
+  // 缓存副本，字段和 /accounts/credits 完全一样（含 packages 与 earliest_expiring），
+  // 白拿。真要立刻更新，走 /workbuddy/credits。
+  if (path === '/workbuddy/accounts') {
+    try {
+      const [intlRes, cnRes] = await Promise.all([
+        wbHub('/accounts?realm=intl'),
+        wbHub('/accounts?realm=cn'),
+      ]);
+      const rowsOf = (r) => (r && r.ok && Array.isArray(r.data?.accounts)) ? r.data.accounts : [];
+      const intl = rowsOf(intlRes);
+      const cn = rowsOf(cnRes);
+      const accounts = [...intl, ...cn];
+      return sendJSON(res, 200, {
+        accounts,
+        usable: accounts.filter((a) => a.enabled !== false).length,
+        realms: { intl: intl.length, cn: cn.length },
+      });
+    } catch (e) {
+      return sendJSON(res, 502, { error: { message: 'WorkBuddy hub 不可达：' + e.message, type: 'upstream_error' } });
+    }
   }
 
   const hubPath = WB_FORWARD[path];

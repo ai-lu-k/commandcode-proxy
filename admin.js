@@ -1529,7 +1529,8 @@
     const hint = $('#wbRealmHint');
     if (hint) {
       const bits = [];
-      if (hd.realm) bits.push('当前出口 ' + (WB_REALM_TEXT[hd.realm] || hd.realm));
+      if (hd.realm) bits.push('默认出口 ' + (WB_REALM_TEXT[hd.realm] || hd.realm));
+      bits.push('两区账号共存，可同时使用');
       if (status && status.panelReady === false) bits.push('未配置 hub 面板密码 → 账号列表不可读');
       hint.textContent = bits.join(' · ');
     }
@@ -1670,6 +1671,11 @@
       const usable = state.wb?.usable ?? rows.filter((a) => a.enabled !== false).length;
       total.textContent = `${rows.length} / ${usable}`;
     }
+    const totalSub = $('#wbStatAccountsSub');
+    if (totalSub) {
+      const r = state.wb?.realms;
+      totalSub.textContent = r ? `国际版 ${r.intl} · 国内版 ${r.cn}` : '总 / 可用';
+    }
 
     // 额度合计：只把真的有快照的账号算进去，没快照的当「未知」而不是 0
     let remain = 0, size = 0, seen = 0;
@@ -1711,10 +1717,12 @@
       state.wb.status = status;
       renderWbBackends(status);
       try {
-        // 这个端点走的是 /accounts/credits：同样的账号行，但每行的 credits 是填好的
+        // 服务端把 intl / cn 两个列表各取一次再合并（见 proxy.mjs）：两区账号一起显示，
+        // 而且用的是 hub 缓存的 credits，拉这个列表**不打上游**。
         const list = await api('/admin/api/workbuddy/accounts');
         state.wb.accounts = Array.isArray(list) ? list : (list?.accounts || []);
         state.wb.usable = list?.usable ?? null;
+        state.wb.realms = list?.realms ?? null;
       } catch (e) {
         state.wb.accounts = [];
         const hint = $('#wbRealmHint');
@@ -1806,11 +1814,35 @@
     }
   }
 
+  /** 真去上游刷一遍额度。这个动作**每个账号一次计费请求**且上游没有 TTL，
+      所以只在用户显式点击时做；页面刷新走的是缓存的 credits。 */
+  async function wbRefreshCredits() {
+    const btn = $('#wbRefreshCredits');
+    const label = btn && btn.querySelector('.btn-label');
+    const old = label ? label.textContent : '';
+    if (btn) btn.disabled = true;
+    if (label) label.textContent = '刷新中…';
+    try {
+      const r = await api('/admin/api/workbuddy/credits', { method: 'POST', body: JSON.stringify({}) });
+      const results = Array.isArray(r?.results) ? r.results : [];
+      const ok = results.filter((x) => x.ok).length;
+      const bad = results.length - ok;
+      toast(`额度已刷新：成功 ${ok} 个${bad ? `，失败 ${bad} 个` : ''}`, bad ? 'err' : 'ok');
+      await refreshWorkbuddy();
+    } catch (e) {
+      toast('刷新额度失败：' + e.message, 'err');
+    } finally {
+      if (btn) btn.disabled = false;
+      if (label) label.textContent = old || '刷新额度';
+    }
+  }
+
   $('#wbRealmSeg').addEventListener('click', (e) => {
     const b = e.target.closest('.seg[data-realm]');
     if (b) wbSetRealm(b.dataset.realm);
   });
   $('#wbRefresh').addEventListener('click', () => refreshWorkbuddy());
+  $('#wbRefreshCredits').addEventListener('click', () => wbRefreshCredits());
   $('#wbAddAccount').addEventListener('click', () => wbStartLogin());
 
   // 点击卡片空白处不触发任何操作，但 Enter 在按钮上由浏览器原生处理
