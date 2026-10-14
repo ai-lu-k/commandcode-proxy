@@ -181,6 +181,53 @@ test('realm 预筛：只在某一版提供的模型不会被送去另一版', as
   });
 });
 
+test('客户端提前挂断不算渠道失败（SSE 收完就关是常态）', async (t) => {
+  // 一个慢慢吐块的假上游：客户端读一块就走，模拟真实 SSE 客户端的行为
+  const streaming = await startMockUpstream({
+    onRequest: async (req, res) => {
+      if (!req.url.startsWith('/v1/chat')) return;
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      for (let i = 0; i < 10; i++) {
+        res.write(`data: {"i":${i}}\n\n`);
+        await sleep(150);
+      }
+      res.end();
+    },
+  });
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-wbabort-'));
+  writeFileSync(join(workdir, 'keys.json'), JSON.stringify({
+    lb: {}, settings: {}, keys: [],
+    wbChannels: [{ id: 'c-s', name: '慢流', realm: 'intl', hubUrl: `http://127.0.0.1:${streaming.port}`, weight: 1, priority: 0, enabled: true }],
+  }, null, 2));
+  const proxy = await startProxy({ upstreamPort: streaming.port, cwd: workdir, env: { WB_EXIT2_PORT: '0' } });
+  t.after(async () => {
+    await proxy.kill();
+    await streaming.close();
+    try { rmSync(workdir, { recursive: true, force: true }); } catch {}
+  });
+
+  // 读第一块就断开
+  const ac = new AbortController();
+  const r = await fetch(`${proxy.base}/wb/v1/chat/completions`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(CHAT), signal: ac.signal,
+  });
+  assert.equal(r.status, 200);
+  const reader = r.body.getReader();
+  await reader.read();
+  ac.abort();
+  await sleep(400);   // 让服务端把 close 处理完
+
+  const v = await (await proxy.get('/admin/api/wb/channels')).json();
+  const c = v.channels[0];
+  assert.ok(c.stats.samples >= 1, `挂断也该留下采样，实际 ${c.stats.samples}`);
+  assert.equal(c.stats.errorCount, 0, '客户端挂断不该算成渠道失败');
+  assert.equal(c.breakerActive, false, '更不该因此熔断');
+  const last = (v.recent || [])[v.recent.length - 1];
+  assert.match(last.err, /客户端提前断开/);
+  assert.equal(last.port, proxy.port, '端口要记下来（响应结束后 socket 已解绑）');
+});
+
 test('两个端口 = 两个出口：端口定死版本，各走各的', async (t) => {
   const intl = await startMockUpstream({});
   const cn = await startMockUpstream({});

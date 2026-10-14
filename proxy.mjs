@@ -5359,6 +5359,8 @@ function wbCrossRealmError(text) {
    与 CC 的 /v1/* 完全独立 —— 那边是站点渠道正在用的出口，一个字节都不动。
    逐块透传、不缓冲，否则 SSE 流会被憋住。 */
 async function handleWorkbuddyEgress(req, res, url) {
+  // 端口要在这里就取：响应结束后 socket 会解绑，那时候再读就是 undefined
+  const localPort = req.socket?.localPort;
   wbDiag('enter', { lastPath: url.pathname });
   const cfg = WB();
   if (!cfg.enabled) {
@@ -5383,7 +5385,7 @@ async function handleWorkbuddyEgress(req, res, url) {
   const model = wbModelOfBody(body);
   wbDiag('model', { lastModel: model });
   // 端口决定出口版本；池子里这个版本一个渠道都没配时退回隐式渠道（靠 X-Realm 说话）。
-  const exitRealm = wbRealmForPort(req.socket?.localPort);
+  const exitRealm = wbRealmForPort(localPort);
   let plan = channels.length ? wbPlan(model, exitRealm) : [null];
   // 这个版本一个渠道都没配（或全被停用）→ 退回隐式渠道，靠 X-Realm 说话
   if (!plan.length) { wbDiag('noPlan'); plan = [null]; }
@@ -5403,7 +5405,10 @@ async function handleWorkbuddyEgress(req, res, url) {
     if (realm) headers['X-Realm'] = realm;
 
     const ac = new AbortController();
-    const onClose = () => ac.abort();
+    // 客户端提前挂断（SSE 收完就关是常态）会触发 res 的 close。它必须能被区分出来：
+    // 这不是渠道失败，算进错误率会把健康的出口熔断掉。
+    let clientGone = false;
+    const onClose = () => { clientGone = true; ac.abort(); };
     res.once('close', onClose);
     const t0 = Date.now();
     let upstream = null;
@@ -5412,7 +5417,7 @@ async function handleWorkbuddyEgress(req, res, url) {
     } catch (e) {
       res.removeListener('close', onClose);
       if (ch) wbRecordSample(ch, { at: Date.now(), ttfb: Date.now() - t0, ok: false, status: 0, error: e.message });
-      wbNoteRecent({ path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort, status: 0, ok: false, err: e.message });
+      wbNoteRecent({ path: url.pathname, model, channel: ch?.name || '默认', port: localPort, status: 0, ok: false, err: e.message });
       lastError = 'WorkBuddy hub 不可达：' + e.message;
       if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } return; }
       continue;
@@ -5437,7 +5442,7 @@ async function handleWorkbuddyEgress(req, res, url) {
         wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: upstream.status, error: `${upstream.status}` });
       }
       wbNoteRecent({
-        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
         status: upstream.status, ok: false, ttfb, err: '换下一条：' + String(errorText || '').slice(0, 120),
       });
       lastStatus = upstream.status;
@@ -5471,7 +5476,7 @@ async function handleWorkbuddyEgress(req, res, url) {
       }
       wbDiag('record');
       wbNoteRecent({
-        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
         status: upstream.status, ok: upstream.status < 400, ttfb, totalMs: Date.now() - t0,
         err: upstream.status < 400 ? '' : String(errorText || '').slice(0, 200),
       });
@@ -5479,12 +5484,18 @@ async function handleWorkbuddyEgress(req, res, url) {
     } catch (e) {
       if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } }
       else lastError = 'WorkBuddy hub 不可达：' + e.message;
-      if (ch && !res.headersSent) {
-        if (wbRecordSample(ch, { at: Date.now(), ttfb, ok: false, status: 0, error: e.message })) saveKeyStore();
+      // 客户端挂断 → 不算渠道失败，但首字延迟照样记（要慢到让客户端放弃，那也是
+      // 这条出口的问题，只是不该走错误率那条线）。
+      if (ch) {
+        const rec = clientGone
+          ? { at: Date.now(), ttfb, ok: true, status: upstream.status, error: '' }
+          : { at: Date.now(), ttfb, ok: false, status: 0, error: e.message };
+        if (wbRecordSample(ch, rec)) saveKeyStore();
       }
       wbNoteRecent({
-        path: url.pathname, model, channel: ch?.name || '默认', port: req.socket?.localPort,
-        status: 0, ok: false, ttfb, err: '流中断：' + e.message,
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
+        status: clientGone ? upstream.status : 0, ok: clientGone, ttfb,
+        err: clientGone ? '客户端提前断开（不计失败）' : '流中断：' + e.message,
       });
       return;
     } finally {
