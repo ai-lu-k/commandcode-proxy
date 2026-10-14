@@ -5384,11 +5384,24 @@ async function handleWorkbuddyEgress(req, res, url) {
   const channels = keyStore.wbChannels || [];
   const model = wbModelOfBody(body);
   wbDiag('model', { lastModel: model });
-  // 端口决定出口版本；池子里这个版本一个渠道都没配时退回隐式渠道（靠 X-Realm 说话）。
+  // 端口决定出口版本；这个版本配过渠道（不论是否启用）就说明操作者接管过它。
   const exitRealm = wbRealmForPort(localPort);
+  const configured = channels.filter((c) => !exitRealm || c.realm === exitRealm);
   let plan = channels.length ? wbPlan(model, exitRealm) : [null];
-  // 这个版本一个渠道都没配（或全被停用）→ 退回隐式渠道，靠 X-Realm 说话
-  if (!plan.length) { wbDiag('noPlan'); plan = [null]; }
+  if (!plan.length) {
+    if (configured.length) {
+      // 配过渠道但这个版本一条可用的都没有 —— 这就是「手动停用」的意思，必须真的不
+      // 服务：退回隐式渠道会把同一个版本又用起来，开关等于没有。站点收到 503 会自动
+      // 换到另一个端口（另一个版本）。
+      wbDiag('noPlan');
+      return sendJSON(res, 503, {
+        error: { message: `WorkBuddy ${exitRealm || ''} 出口已停用`, type: 'server_busy' },
+        retry_after: 30,
+      });
+    }
+    // 这个版本压根没配过渠道（全新部署）：退回隐式渠道，靠 X-Realm 说话
+    plan = [null];
+  }
   wbDiag('forward');
 
   let lastError = '';

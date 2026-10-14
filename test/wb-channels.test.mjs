@@ -281,4 +281,26 @@ test('两个端口 = 两个出口：端口定死版本，各走各的', async (t
     assert.deepEqual(v.exits.map((e) => e.realm), ['intl', 'cn']);
     assert.equal(v.channels.find((c) => c.realm === 'cn').port, exit2);
   });
+
+  await t.test('手动停用某个出口 → 那个端口直接 503，不会偷偷换回同一个版本', async () => {
+    const post = () => fetch(`${exit2Base}/wb/v1/chat/completions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'deepseek-v4.1-flash', messages: [] }),
+    });
+    const before = cn.seen.length;
+    assert.equal((await post()).status, 200);
+    assert.equal(cn.seen.length, before + 1);
+
+    const patch = (enabled) => fetch(`${proxy.base}/admin/api/wb/channels/c-cn`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    await patch(false);
+    assert.equal((await post()).status, 503, '停用的出口必须真的不服务');
+    assert.equal(cn.seen.length, before + 1, '不该再碰国内版上游');
+    // 另一个端口不受影响
+    assert.equal((await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] })).status, 200);
+    await patch(true);
+    assert.equal((await post()).status, 200, '重新启用后要能恢复');
+  });
 });
