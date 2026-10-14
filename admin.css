@@ -1454,6 +1454,7 @@ input:disabled { opacity: 0.6; }
 }
 
 /* ── WorkBuddy 标签页 ──────────────────────────────────── */
+.wb-kpis { margin: 0 0 18px; }
 .wb-bar {
   display: flex;
   align-items: center;
@@ -1466,25 +1467,27 @@ input:disabled { opacity: 0.6; }
 .wb-bar-hint { margin-left: auto; font-size: 12px; color: var(--faint); }
 
 .wb-list { display: flex; flex-direction: column; }
-.wb-account {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
+.wb-card {
+  padding: 14px 16px;
   border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
-.wb-account:last-child { border-bottom: 0; }
-.wb-account-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.wb-account-main b { font-size: 13.5px; color: var(--ink); font-weight: 600; }
-.wb-account-main small {
-  font-size: 11.5px;
+.wb-card:last-child { border-bottom: 0; }
+.wb-card-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.wb-card-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.wb-card-title b { font-size: 13.5px; color: var(--ink); font-weight: 600; }
+.wb-card-title small {
+  font-size: 11px;
   color: var(--faint);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  max-width: 260px;
 }
-.wb-account-meta {
+.wb-card-tags {
   margin-left: auto;
   display: flex;
   align-items: center;
@@ -1492,6 +1495,57 @@ input:disabled { opacity: 0.6; }
   flex-wrap: wrap;
   justify-content: flex-end;
 }
+
+.wb-meter { display: flex; flex-direction: column; gap: 5px; }
+.wb-meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }
+.wb-meter-top b { font-size: 13px; color: var(--ink); font-weight: 600; }
+.wb-track { height: 6px; border-radius: 999px; background: var(--track); overflow: hidden; }
+.wb-track i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-3), var(--accent-2));
+  transition: width .3s ease;
+}
+.wb-meter-sub { font-size: 11.5px; color: var(--faint); }
+
+.wb-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 8px; }
+.wb-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.wb-fact span { font-size: 11px; color: var(--faint); }
+.wb-fact b { font-size: 12.5px; color: var(--ink-2); font-weight: 600; }
+
+.wb-note { font-size: 11.5px; color: var(--warn); }
+.wb-pkgs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+}
+.wb-pkg { display: flex; align-items: center; gap: 10px; padding: 7px 10px; background: var(--surface-2); }
+.wb-pkg-name { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.wb-pkg-name b { font-size: 12px; color: var(--ink-2); font-weight: 600; }
+.wb-pkg-name small {
+  font-size: 10.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+.wb-pkg-num { margin-left: auto; display: flex; flex-direction: column; gap: 1px; align-items: flex-end; }
+.wb-pkg-num b { font-size: 12.5px; color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.wb-pkg-num b.is-dead { color: var(--faint); text-decoration: line-through; }
+.wb-pkg-num small { font-size: 10.5px; color: var(--faint); }
 .wb-chip {
   font-size: 11.5px;
   padding: 3px 8px;
@@ -1546,8 +1600,8 @@ input:disabled { opacity: 0.6; }
 .wb-login-actions .btn { flex: 1; justify-content: center; }
 
 @media (max-width: 720px) {
-  .wb-account { flex-wrap: wrap; }
-  .wb-account-meta { margin-left: 0; width: 100%; justify-content: flex-start; }
+  .wb-card-tags { margin-left: 0; justify-content: flex-start; }
+  .wb-card-title small { max-width: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

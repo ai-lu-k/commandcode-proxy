@@ -4905,7 +4905,13 @@ async function wbProbe(base, path) {
 
 /** 只读转发映射：面板路径 → hub 路径 */
 const WB_FORWARD = {
-  '/workbuddy/accounts': '/accounts',
+  // 用 /accounts/credits 而不是 /accounts：前者同样的行，但每行多一个已填好的
+  // credits 对象（remain/size/used/percent/is_paid_user/packages…），后者里它是 null。
+  // 它是服务端的只读快照，不会每次轮询都去戳上游。
+  '/workbuddy/accounts': '/accounts/credits',
+  '/workbuddy/grants': '/accounts/credits/grants',
+  '/workbuddy/analytics': '/usage/analytics',
+  '/workbuddy/remaining': '/usage/remaining',
   '/workbuddy/realm': '/realm',
   '/workbuddy/usage': '/usage/analytics',
   '/workbuddy/login/start': '/accounts/login/start',

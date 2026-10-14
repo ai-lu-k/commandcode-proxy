@@ -632,6 +632,41 @@
 
       <!-- ══ 标签页 5：WorkBuddy ═══════════════════════════════ -->
       <section class="tab-panel" id="panel-workbuddy" data-panel="workbuddy" role="tabpanel" aria-labelledby="tabBtnWorkbuddy" hidden>
+        <div class="kpis wb-kpis">
+          <article class="kpi">
+            <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-robot"/></svg></span>
+            <div class="kpi-body">
+              <span class="kpi-label">WorkBuddy 账号</span>
+              <strong id="wbStatAccounts">—</strong>
+              <span class="kpi-sub" id="wbStatAccountsSub">总 / 可用</span>
+            </div>
+          </article>
+          <article class="kpi">
+            <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+            <div class="kpi-body">
+              <span class="kpi-label">积分剩余 / 总量</span>
+              <strong id="wbStatCredits">—</strong>
+              <span class="kpi-sub" id="wbStatCreditsSub">上游只读快照</span>
+            </div>
+          </article>
+          <article class="kpi">
+            <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
+            <div class="kpi-body">
+              <span class="kpi-label">请求数</span>
+              <strong id="wbStatReqs">—</strong>
+              <span class="kpi-sub" id="wbStatReqsSub">窗口 / 累计</span>
+            </div>
+          </article>
+          <article class="kpi">
+            <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
+            <div class="kpi-body">
+              <span class="kpi-label">Token 用量</span>
+              <strong id="wbStatTokens">—</strong>
+              <span class="kpi-sub" id="wbStatTokensSub">窗口 / 累计</span>
+            </div>
+          </article>
+        </div>
+
         <div class="layout">
           <div class="col-main">
             <section class="panel">

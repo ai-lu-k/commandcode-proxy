@@ -1518,9 +1518,12 @@
     const accounts = hd.accounts ?? '—';
     const ready = hd.accounts_ready ?? '—';
     el.innerHTML = [
-      wbBackendRow('网关 hub', `${hub.url || '—'} · 账号 ${accounts} / 可用 ${ready}`, hub),
-      wbBackendRow('Go 上游', `${up.url || '—'} · 账号 ${up.data?.total ?? '—'}`, up),
-      wbBackendRow('账号控制台', mgr.url || '—', mgr),
+      // 三个后端里有两种账号池：hub 是**本页的数据源**，Go 上游+控制台是另一套
+      // 独立池（在 manager 里纳管），两者账号互不相通，标签里要说清楚，
+      // 否则「Go 上游 账号 0」看起来像故障。
+      wbBackendRow('网关 hub（本页数据源）', `${hub.url || '—'} · 账号 ${accounts} / 可用 ${ready}`, hub),
+      wbBackendRow('Go 上游（独立账号池）', `${up.url || '—'} · 账号 ${up.data?.total ?? '—'}`, up),
+      wbBackendRow('账号控制台（管 Go 上游那套）', mgr.url || '—', mgr),
     ].join('');
     if (hd.realm) wbSetRealmActive(hd.realm);
     const hint = $('#wbRealmHint');
@@ -1530,6 +1533,116 @@
       if (status && status.panelReady === false) bits.push('未配置 hub 面板密码 → 账号列表不可读');
       hint.textContent = bits.join(' · ');
     }
+  }
+
+  /** "0.0%" → 0 */
+  function wbPct(s) {
+    const n = parseFloat(String(s == null ? '' : s).replace('%', ''));
+    return isFinite(n) ? n : 0;
+  }
+  /** 保留 digits 位小数，非法值给 — */
+  function wbNum(n, digits = 2) {
+    if (n == null || n === '') return '—';
+    const v = Number(n);
+    if (!isFinite(v)) return '—';
+    return v.toLocaleString('zh-CN', { maximumFractionDigits: digits });
+  }
+  function wbExpiry(a) {
+    if (a.expiresIn) return String(a.expiresIn);
+    if (!a.expiresAt) return '—';
+    return fmtTime(a.expiresAt * 1000);
+  }
+  /** 一个积分包什么时候没了。no_expiry 的包 days_left 是 null，要单独说清楚。 */
+  function wbWhen(p) {
+    if (!p) return '';
+    if (p.no_expiry) return '永久有效';
+    const d = Number(p.days_left);
+    if (isFinite(d) && d > 0) return `${Math.round(d)} 天后到期`;
+    const t = p.cycle_end_time || p.expire_time;
+    return t ? `到期 ${String(t).slice(0, 10)}` : '';
+  }
+  /** credits.earliest_expiring 是**对象**（{name, remain, days_left, cycle_end_time}），
+      不是字符串 —— 直接 String() 会渲染成 [object Object]。 */
+  function wbExpiringLabel(e) {
+    if (!e) return '';
+    if (typeof e === 'string') return e;
+    const name = e.name || e.package_code || '积分包';
+    const remain = e.remain != null ? ` 剩 ${wbNum(e.remain, 0)}` : '';
+    const when = wbWhen(e);
+    return `${name}${remain}${when ? ' · ' + when : ''}`;
+  }
+  function wbPkgRow(p) {
+    const name = p.name || p.package_code || '积分包';
+    const sub = p.sub_product_name || p.product_name || '';
+    const expired = p.is_expired || (Number(p.remain) <= 0);
+    return `<div class="wb-pkg">
+        <div class="wb-pkg-name">
+          <b>${escapeHtml(String(name))}</b>
+          ${sub ? `<small>${escapeHtml(String(sub))}</small>` : ''}
+        </div>
+        <div class="wb-pkg-num">
+          <b class="${expired ? 'is-dead' : ''}">${wbNum(p.remain, 0)} / ${wbNum(p.size, 0)}</b>
+          <small>${escapeHtml(wbWhen(p))}</small>
+        </div>
+      </div>`;
+  }
+  /** 冷却 / 熔断 / 降级 / 停用 / 报错过，都算需要被看见的状态 */
+  function wbStatusChips(a) {
+    const out = [];
+    if (a.enabled === false) out.push('<span class="wb-chip bad">已停用</span>');
+    if (a.inCooldown) out.push(`<span class="wb-chip bad">冷却中${a.cooldownFor ? ' ' + escapeHtml(String(a.cooldownFor)) : ''}</span>`);
+    if (a.breakerFor) out.push('<span class="wb-chip bad">熔断</span>');
+    if (a.degradeFor) out.push('<span class="wb-chip bad">降级</span>');
+    if (a.lastError) out.push(`<span class="wb-chip bad" title="${escapeHtml(String(a.lastError))}">有错误</span>`);
+    if (!out.length) out.push('<span class="wb-chip ok">可用</span>');
+    return out.join('');
+  }
+
+  function wbAccountCard(a) {
+    const uid = String(a.uid || '');
+    const nick = a.nickname || a.email || uid.slice(0, 8) || '—';
+    const c = a.credits || null;
+    const realm = WB_REALM_TEXT[a.realm] || a.realm || '—';
+    const remainPct = c ? Math.max(0, Math.min(100, wbPct(c.remain_percent))) : 0;
+    const pkgs = c && Array.isArray(c.packages) ? c.packages : [];
+    const today = a.dailyTokensToday;
+    const todayLimit = Number(a.dailyTokenLimit || 0);
+
+    const meter = c
+      ? `<div class="wb-meter">
+            <div class="wb-meter-top"><span>积分</span><b>剩余 ${wbNum(c.remain)} / ${wbNum(c.size)}</b></div>
+            <div class="wb-track" role="img" aria-label="剩余 ${remainPct.toFixed(1)}%"><i style="width:${remainPct}%"></i></div>
+            <div class="wb-meter-sub">
+              剩余 ${escapeHtml(String(c.remain_percent || '—'))} · 已用 ${escapeHtml(String(c.used_percent || '—'))}
+              · ${c.is_paid_user ? '付费账号' : '免费账号'}
+            </div>
+          </div>`
+      : '<div class="wb-meter"><div class="wb-meter-sub">尚无额度快照（hub 每 12 小时刷新一次）</div></div>';
+
+    return `<article class="wb-card">
+        <header class="wb-card-head">
+          <span class="wb-dot ${a.enabled === false ? 'off' : 'on'}" aria-hidden="true"></span>
+          <div class="wb-card-title">
+            <b>${escapeHtml(String(nick))}</b>
+            <small title="${escapeHtml(uid)}">${escapeHtml(uid)}</small>
+          </div>
+          <div class="wb-card-tags">
+            <span class="wb-chip">${escapeHtml(realm)}</span>
+            ${a.platform ? `<span class="wb-chip">${escapeHtml(String(a.platform))}</span>` : ''}
+            ${a.product ? `<span class="wb-chip">${escapeHtml(String(a.product))}</span>` : ''}
+            ${wbStatusChips(a)}
+          </div>
+        </header>
+        ${meter}
+        ${c && c.earliest_expiring ? `<div class="wb-note">最早到期：${escapeHtml(wbExpiringLabel(c.earliest_expiring))}</div>` : ''}
+        ${pkgs.length ? `<div class="wb-pkgs">${pkgs.map(wbPkgRow).join('')}</div>` : ''}
+        <div class="wb-facts">
+          <div class="wb-fact"><span>订阅到期</span><b>${escapeHtml(wbExpiry(a))}</b></div>
+          <div class="wb-fact"><span>积分包</span><b>${pkgs.length} 个</b></div>
+          <div class="wb-fact"><span>今日 Token</span><b>${today == null ? '—' : wbNum(today, 0)}${todayLimit ? ' / ' + wbNum(todayLimit, 0) : ''}</b></div>
+          <div class="wb-fact"><span>额度快照</span><b>${escapeHtml(String((c && c.updated_iso) || '—').slice(11) || '—')}</b></div>
+        </div>
+      </article>`;
   }
 
   function renderWbAccounts() {
@@ -1543,26 +1656,50 @@
       return;
     }
     if (empty) empty.classList.add('hidden');
-    wrap.innerHTML = rows.map((a) => {
-      const nick = a.nickname || a.name || a.email || a.uid || '—';
-      const realm = a.realm || a.region || '—';
-      const usable = a.usable ?? a.ready ?? a.enabled;
-      const credits = a.credits ?? a.credit ?? a.remaining;
-      const product = a.product || a.client || '';
-      return `<div class="wb-account">
-          <span class="wb-dot ${usable ? 'on' : 'off'}" aria-hidden="true"></span>
-          <div class="wb-account-main">
-            <b>${escapeHtml(String(nick))}</b>
-            <small>${escapeHtml(String(a.uid || a.id || ''))}</small>
-          </div>
-          <div class="wb-account-meta">
-            ${product ? `<span class="wb-chip">${escapeHtml(String(product))}</span>` : ''}
-            <span class="wb-chip">${escapeHtml(String(realm))}</span>
-            ${credits != null ? `<span class="wb-chip">额度 ${escapeHtml(String(credits))}</span>` : ''}
-            <span class="wb-chip ${usable ? 'ok' : 'bad'}">${usable ? '可用' : '不可用'}</span>
-          </div>
-        </div>`;
-    }).join('');
+    wrap.innerHTML = rows.map(wbAccountCard).join('');
+  }
+
+  function renderWbKpis() {
+    const rows = state.wb?.accounts || [];
+    const an = state.wb?.analytics || null;
+    const win = an?.summary?.window || {};
+    const all = an?.summary?.all_time || {};
+
+    const total = $('#wbStatAccounts');
+    if (total) {
+      const usable = state.wb?.usable ?? rows.filter((a) => a.enabled !== false).length;
+      total.textContent = `${rows.length} / ${usable}`;
+    }
+
+    // 额度合计：只把真的有快照的账号算进去，没快照的当「未知」而不是 0
+    let remain = 0, size = 0, seen = 0;
+    rows.forEach((a) => {
+      if (!a.credits) return;
+      seen += 1;
+      remain += Number(a.credits.remain) || 0;
+      size += Number(a.credits.size) || 0;
+    });
+    const creditsEl = $('#wbStatCredits');
+    if (creditsEl) creditsEl.textContent = seen ? `${wbNum(remain)} / ${wbNum(size)}` : '—';
+    const creditsSub = $('#wbStatCreditsSub');
+    if (creditsSub) {
+      const n = state.wb?.grants?.summary?.count;
+      creditsSub.textContent = n != null ? `${n} 个积分包` : '上游只读快照';
+    }
+
+    const reqs = $('#wbStatReqs');
+    if (reqs) reqs.textContent = `${wbNum(win.requests ?? 0, 0)} / ${wbNum(all.requests ?? 0, 0)}`;
+    const reqsSub = $('#wbStatReqsSub');
+    if (reqsSub) reqsSub.textContent = `窗口错误 ${wbNum(win.errors ?? 0, 0)}`;
+
+    const toks = $('#wbStatTokens');
+    if (toks) toks.textContent = `${wbNum(win.total_tokens ?? 0, 0)} / ${wbNum(all.total_tokens ?? 0, 0)}`;
+    const toksSub = $('#wbStatTokensSub');
+    if (toksSub) {
+      toksSub.textContent = all.cost_cny
+        ? `累计 ¥${wbNum(all.cost_cny)}`
+        : (all.cache_hit_pct ? `缓存命中 ${wbNum(all.cache_hit_pct, 1)}%` : '窗口 / 累计');
+    }
   }
 
   async function refreshWorkbuddy() {
@@ -1574,13 +1711,19 @@
       state.wb.status = status;
       renderWbBackends(status);
       try {
+        // 这个端点走的是 /accounts/credits：同样的账号行，但每行的 credits 是填好的
         const list = await api('/admin/api/workbuddy/accounts');
         state.wb.accounts = Array.isArray(list) ? list : (list?.accounts || []);
+        state.wb.usable = list?.usable ?? null;
       } catch (e) {
         state.wb.accounts = [];
         const hint = $('#wbRealmHint');
         if (hint) hint.textContent = '账号列表读取失败：' + e.message;
       }
+      // 这两个只影响汇总数字，失败了不该把整页拖黑
+      try { state.wb.analytics = await api('/admin/api/workbuddy/analytics'); } catch { state.wb.analytics = null; }
+      try { state.wb.grants = await api('/admin/api/workbuddy/grants'); } catch { state.wb.grants = null; }
+      renderWbKpis();
       renderWbAccounts();
       renderTabBadges();
     } catch (e) {
