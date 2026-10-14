@@ -517,62 +517,98 @@
     $('#lbCooldownMs').value = lb.cooldownMs ?? 60000;
   }
 
-  /* ── 标签页 ──────────────────────────────────────────── */
-  const TABS = ['keys', 'routing', 'sessions', 'alerts', 'workbuddy'];
-  const TAB_STORE_KEY = 'cc-proxy-tab';
+  /* ── 视图路由（一级=数据源，二级=该源的分区） ────────────
+     视图 id 形如 "cc/keys"、"wb/accounts"，hash 里直接用它，所以每个视图都能
+     分享 / 刷新停留。
 
-  function setTab(name, { save = true } = {}) {
-    const t = TABS.includes(name) ? name : 'keys';
-    state.tab = t;
-    $$('#tabs .tab').forEach((btn) => {
-      const on = btn.dataset.tab === t;
+     旧的单段 hash（#keys、#workbuddy…）继续认 —— 管理台地址早就被人收藏成
+     https://ai.lu-k.cn/proxy/admin#keys 了，不能把这个入口弄丢。 */
+  const VIEW_STORE_KEY = 'cc-proxy-view';
+  const LEGACY_VIEWS = {
+    keys: 'cc/keys', routing: 'cc/routing', sessions: 'cc/sessions', alerts: 'cc/alerts',
+    workbuddy: 'wb/accounts',
+  };
+  const FALLBACK_VIEW = 'cc/keys';
+
+  function allViews() {
+    return $$('.side-item[data-view]').map((b) => b.dataset.view);
+  }
+  function normalizeView(raw) {
+    const v = String(raw || '').replace(/^#/, '').trim();
+    if (!v) return '';
+    if (v.includes('/')) return allViews().includes(v) ? v : '';
+    return LEGACY_VIEWS[v] || '';
+  }
+
+  function setView(view, { save = true } = {}) {
+    const list = allViews();
+    const v = list.includes(view) ? view : FALLBACK_VIEW;
+    state.view = v;
+    state.tab = v;                       // 旧字段留着，别的地方还在读
+
+    $$('.side-item[data-view]').forEach((btn) => {
+      const on = btn.dataset.view === v;
       btn.classList.toggle('is-active', on);
-      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      btn.setAttribute('aria-current', on ? 'page' : 'false');
       btn.tabIndex = on ? 0 : -1;
     });
-    $$('.tab-panel').forEach((panel) => {
-      const on = panel.dataset.panel === t;
+    $$('.view-panel').forEach((panel) => {
+      const on = panel.dataset.view === v;
       panel.classList.toggle('is-active', on);
       if (on) panel.removeAttribute('hidden');
       else panel.setAttribute('hidden', '');
     });
-    if (save) { try { localStorage.setItem(TAB_STORE_KEY, t); } catch { /* 忽略 */ } }
-    // 让每个标签页都有自己的 URL，可直接分享 / 刷新停留在同一页
-    if (location.hash.replace(/^#/, '') !== t) {
-      try { history.replaceState(null, '', '#' + t); } catch { location.hash = t; }
+    // hero 跟着数据源走：两套 KPI 不再混在同一块
+    const source = v.split('/')[0];
+    $$('.hero[data-source]').forEach((h) => {
+      if (h.dataset.source === source) h.removeAttribute('hidden');
+      else h.setAttribute('hidden', '');
+    });
+    document.body.dataset.source = source;
+
+    if (save) { try { localStorage.setItem(VIEW_STORE_KEY, v); } catch { /* 忽略 */ } }
+    if (location.hash.replace(/^#/, '') !== v) {
+      try { history.replaceState(null, '', '#' + v); } catch { location.hash = v; }
     }
-    if (t === 'sessions') refreshSessions();
-    if (t === 'alerts') refreshAlerts();
-    if (t === 'workbuddy') refreshWorkbuddy();
+
+    // 各视图按需拉自己的数据，切过去才请求
+    if (v === 'cc/sessions') refreshSessions();
+    if (v === 'cc/alerts') refreshAlerts();
+    // 只要进了某个数据源，就把它那套 KPI 刷新一遍（两套 KPI 不再共用一块）
+    if (source === 'wb') refreshWorkbuddy();
+    if (v === 'wb/schedule') refreshWbSchedule();
   }
 
-  function initialTab() {
-    const fromHash = location.hash.replace(/^#/, '');
-    if (TABS.includes(fromHash)) return fromHash;
+  function initialView() {
+    const fromHash = normalizeView(location.hash);
+    if (fromHash) return fromHash;
     try {
-      const saved = localStorage.getItem(TAB_STORE_KEY);
-      if (TABS.includes(saved)) return saved;
+      const saved = normalizeView(localStorage.getItem(VIEW_STORE_KEY));
+      if (saved) return saved;
     } catch { /* 忽略 */ }
-    return 'keys';
+    return FALLBACK_VIEW;
   }
 
-  $('#tabs').addEventListener('click', (e) => {
-    const btn = e.target.closest('.tab[data-tab]');
-    if (btn) setTab(btn.dataset.tab);
+  const sidebarEl = $('#sidebar');
+  sidebarEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.side-item[data-view]');
+    if (btn) setView(btn.dataset.view);
   });
-  // role=tablist 的惯例：左右方向键切换
-  $('#tabs').addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  // 上下方向键在侧边栏里切换，保留原来 tablist 的操作习惯
+  sidebarEl.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+    const list = allViews();
+    if (!list.length) return;
     e.preventDefault();
-    const cur = Math.max(0, TABS.indexOf(state.tab));
-    const next = (cur + (e.key === 'ArrowRight' ? 1 : TABS.length - 1)) % TABS.length;
-    setTab(TABS[next]);
-    const btn = $(`#tabs .tab[data-tab="${TABS[next]}"]`);
+    const cur = Math.max(0, list.indexOf(state.view));
+    const next = (cur + (e.key === 'ArrowDown' ? 1 : list.length - 1)) % list.length;
+    setView(list[next]);
+    const btn = $(`.side-item[data-view="${list[next]}"]`);
     if (btn) btn.focus();
   });
   window.addEventListener('hashchange', () => {
-    const t = location.hash.replace(/^#/, '');
-    if (TABS.includes(t) && t !== state.tab) setTab(t, { save: false });
+    const v = normalizeView(location.hash);
+    if (v && v !== state.view) setView(v, { save: false });
   });
 
   function renderTabBadges() {
@@ -597,6 +633,9 @@
       wbCount.textContent = String(n);
       wbCount.hidden = !n;
     }
+    // WorkBuddy 调度标签：hub 的定时调度器开着就点个绿点
+    const wbDot = $('#tabWbSchedDot');
+    if (wbDot) wbDot.hidden = !state.wb?.sched?.enabled;
   }
 
   /** 会话列表单独刷新（很轻，不动额度） */
@@ -1148,7 +1187,7 @@
       $('#apiBase').title = data.apiBase || 'api';
       renderAll();
       renderSessions();
-      if (state.tab === 'alerts') await refreshAlerts();
+      if (state.view === 'cc/alerts') await refreshAlerts();
       else refreshAlertsSilent();
       $('#lastSync').textContent = `数据同步于 ${fmtClock(Date.now())}`;
     } catch (e) {
@@ -1320,11 +1359,11 @@
       }
     }
     // 停在会话页时自动刷新（只查会话，不动额度）
-    if (state.tab === 'sessions' && Date.now() - lastSessionFetch > 15000) {
+    if (state.view === 'cc/sessions' && Date.now() - lastSessionFetch > 15000) {
       refreshSessions();
     }
     // 停在告警页时自动刷新（未恢复告警数、窗口失败率）
-    if (state.tab === 'alerts' && Date.now() - lastAlertFetch > 15000) {
+    if (state.view === 'cc/alerts' && Date.now() - lastAlertFetch > 15000) {
       refreshAlertsSilent();
       renderAlerts();
     }
@@ -1526,6 +1565,17 @@
       wbBackendRow('账号控制台（管 Go 上游那套）', mgr.url || '—', mgr),
     ].join('');
     if (hd.realm) wbSetRealmActive(hd.realm);
+    // 数据源徽标
+    const badge = $('#wbBadge');
+    const badgeText = $('#wbBadgeText');
+    if (badge && badgeText) {
+      const hubUp = !!hub.up;
+      badge.classList.remove('tone-ok', 'tone-warn', 'tone-idle');
+      badge.classList.add(hubUp ? 'tone-ok' : 'tone-warn');
+      badgeText.textContent = hubUp
+        ? `hub 在线 · ${accounts} 个账号`
+        : 'hub 离线';
+    }
     const hint = $('#wbRealmHint');
     if (hint) {
       const bits = [];
@@ -1837,6 +1887,80 @@
     }
   }
 
+  /* ── WorkBuddy · 调度与轮询 ─────────────────────────────
+     数据来自 hub 的 /scheduler 与 /tasks。和 CC 的调度完全是两套东西：
+     CC 那边管的是"额度轮询 + 会话粘性"，这边管的是上游账号的签到/保活排程。 */
+  let wbSchedFetching = false;
+
+  function renderWbSchedule(sched, tasks) {
+    const chk = $('#wbSchedEnabled');
+    if (chk) chk.checked = !!sched?.enabled;
+
+    const facts = $('#wbSchedFacts');
+    if (facts) {
+      const rows = [
+        ['排程', sched?.mode || '—'],
+        ['上次运行', sched?.last_run_time || '—'],
+        ['下次运行', sched?.next_run_time || '—'],
+      ];
+      facts.innerHTML = rows
+        .map(([k, v]) => `<div class="wb-fact"><span>${escapeHtml(k)}</span><b>${escapeHtml(String(v))}</b></div>`)
+        .join('');
+    }
+
+    const logs = $('#wbSchedLogs');
+    if (logs) {
+      const lines = Array.isArray(sched?.logs) ? sched.logs : [];
+      logs.textContent = lines.length ? lines.join('\n') : '（暂无日志）';
+    }
+
+    const list = $('#wbTaskList');
+    const empty = $('#wbTaskEmpty');
+    const items = Array.isArray(tasks?.tasks) ? tasks.tasks : [];
+    const msg = $('#wbTaskMsg');
+    if (msg) msg.textContent = tasks?.msg || (items.length ? '' : '—');
+    if (list) {
+      list.innerHTML = items.map((t) => {
+        const name = t.name || t.task || t.label || t.title || '任务';
+        const acct = t.nickname || t.uid || '';
+        const failed = t.ok === false || t.status === 'failed' || t.state === 'failed';
+        const state = t.status || t.state || (t.ok === true ? 'ok' : '');
+        const when = t.last_run || t.updated_at || t.last_run_time || '';
+        return `<div class="wb-pkg">
+            <span class="wb-dot ${failed ? 'off' : 'on'}" aria-hidden="true"></span>
+            <div class="wb-pkg-name">
+              <b>${escapeHtml(String(name))}</b>
+              <small>${escapeHtml(String(acct))}${when ? ' · ' + escapeHtml(String(when)) : ''}</small>
+            </div>
+            <div class="wb-pkg-num">
+              ${state ? `<b class="${failed ? 'is-dead' : ''}">${escapeHtml(String(state))}</b>` : ''}
+            </div>
+          </div>`;
+      }).join('');
+    }
+    if (empty) empty.classList.toggle('hidden', items.length > 0);
+  }
+
+  async function refreshWbSchedule() {
+    if (wbSchedFetching) return;
+    wbSchedFetching = true;
+    try {
+      const sched = await api('/admin/api/workbuddy/schedule');
+      // 任务列表在没账号时会 4xx/空，不该把整页拖黑
+      let tasks = null;
+      try { tasks = await api('/admin/api/workbuddy/tasks'); } catch { tasks = null; }
+      state.wb = state.wb || {};
+      state.wb.sched = sched;
+      state.wb.tasks = tasks;
+      renderWbSchedule(sched, tasks);
+      renderTabBadges();
+    } catch (e) {
+      toast('调度状态读取失败：' + e.message, 'err');
+    } finally {
+      wbSchedFetching = false;
+    }
+  }
+
   $('#wbRealmSeg').addEventListener('click', (e) => {
     const b = e.target.closest('.seg[data-realm]');
     if (b) wbSetRealm(b.dataset.realm);
@@ -1844,8 +1968,39 @@
   $('#wbRefresh').addEventListener('click', () => refreshWorkbuddy());
   $('#wbRefreshCredits').addEventListener('click', () => wbRefreshCredits());
   $('#wbAddAccount').addEventListener('click', () => wbStartLogin());
+  $('#wbSchedRefresh').addEventListener('click', () => refreshWbSchedule());
+  $('#wbSchedTrigger').addEventListener('click', async () => {
+    const btn = $('#wbSchedTrigger');
+    if (btn) btn.disabled = true;
+    try {
+      await api('/admin/api/workbuddy/schedule/trigger', { method: 'POST', body: '{}' });
+      toast('已触发一轮巡检');
+    } catch (e) {
+      toast('触发失败：' + e.message, 'err');
+    } finally {
+      if (btn) btn.disabled = false;
+      await refreshWbSchedule();
+    }
+  });
+  $('#wbSchedEnabled').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    e.target.disabled = true;
+    try {
+      await api('/admin/api/workbuddy/schedule/toggle', {
+        method: 'POST',
+        body: JSON.stringify({ enabled: on }),
+      });
+      toast(on ? '已启用后台调度' : '已关闭后台调度');
+    } catch (err) {
+      e.target.checked = !on;
+      toast('切换失败：' + err.message, 'err');
+    } finally {
+      e.target.disabled = false;
+      await refreshWbSchedule();
+    }
+  });
 
   // 点击卡片空白处不触发任何操作，但 Enter 在按钮上由浏览器原生处理
-  setTab(initialTab(), { save: false });
+  setView(initialView(), { save: false });
   reload();
 })();

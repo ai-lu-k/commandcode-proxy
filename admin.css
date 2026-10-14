@@ -326,6 +326,9 @@ kbd {
 .page { max-width: 1360px; margin: 0 auto; padding: 0 22px; }
 
 .hero { padding: 30px 0 20px; display: grid; gap: 20px; }
+/* 两套 hero 按数据源切换。必须显式写这条：`.hero` 自己的 display:grid 是作者样式，
+   会盖掉 UA 样式表里的 [hidden]{display:none}，光加 hidden 属性是藏不住的。 */
+.hero[hidden] { display: none; }
 .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
 .lede { margin-top: 7px; color: var(--muted); font-size: 13.5px; }
 .hero-badge {
@@ -407,38 +410,81 @@ kbd {
 .side { display: grid; gap: 16px; align-content: start; }
 .col-main { display: grid; gap: 16px; align-content: start; min-width: 0; }
 
-/* ── 7a. 标签页 ──────────────────────────────────────────── */
-.tabs {
-  display: flex;
-  gap: 2px;
-  margin: 2px 0 18px;
-  border-bottom: 1px solid var(--line);
-  overflow-x: auto;
-  scrollbar-width: none;
+/* ── 7a. 侧边栏导航（一级=数据源，二级=该源的分区） ───────── */
+.shell {
+  display: grid;
+  grid-template-columns: 236px minmax(0, 1fr);
+  gap: 26px;
+  align-items: start;
 }
-.tabs::-webkit-scrollbar { display: none; }
-.tab {
-  appearance: none;
-  display: inline-flex;
+.sidebar {
+  position: sticky;
+  top: 80px;
+  display: grid;
+  gap: 14px;
+  padding-bottom: 8px;
+}
+.side-group {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.side-head {
+  display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 11px 15px;
+  gap: 10px;
+  padding: 11px 13px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
+}
+.side-logo {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  flex: none;
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+.side-logo .ic { width: 15px; height: 15px; }
+.side-logo.tone-cyan {
+  background: color-mix(in srgb, var(--accent-3) 16%, transparent);
+  color: var(--accent-3);
+}
+.side-title { min-width: 0; display: grid; gap: 1px; }
+.side-title b { font-size: 13px; color: var(--ink); letter-spacing: -0.01em; }
+.side-title small {
+  font-size: 10.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-nav { display: grid; padding: 5px; gap: 1px; }
+.side-item {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 10px;
   border: 0;
+  border-radius: 8px;
   background: transparent;
   color: var(--muted);
   font: 600 13px/1 var(--sans);
+  text-align: left;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  white-space: nowrap;
-  border-radius: 8px 8px 0 0;
-  transition: color 0.16s var(--ease), background 0.16s var(--ease), border-color 0.16s var(--ease);
+  transition: color 0.16s var(--ease), background 0.16s var(--ease);
 }
-.tab .ic { width: 16px; height: 16px; }
-.tab:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 5%, transparent); }
-.tab.is-active { color: var(--ink); border-bottom-color: var(--accent); }
-.tab.is-active .ic { color: var(--accent); }
-.tab-count {
+.side-item .ic { width: 15px; height: 15px; flex: none; }
+.side-item > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-item:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 5%, transparent); }
+.side-item.is-active { color: var(--ink); background: var(--accent-soft); }
+.side-item.is-active .ic { color: var(--accent); }
+.side-count {
   font-size: 11px;
   font-weight: 620;
   font-variant-numeric: tabular-nums;
@@ -446,9 +492,13 @@ kbd {
   border-radius: var(--r-full);
   background: color-mix(in srgb, var(--ink) 8%, transparent);
   color: var(--muted);
+  flex: none;
 }
-.tab.is-active .tab-count { background: var(--accent-soft); color: var(--accent); }
-.tab-dot {
+.side-item.is-active .side-count {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  color: var(--accent);
+}
+.side-dot {
   width: 7px;
   height: 7px;
   border-radius: 50%;
@@ -456,10 +506,11 @@ kbd {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 18%, transparent);
   flex: none;
 }
-.tab-dot[hidden] { display: none; }
+.side-dot[hidden] { display: none; }
+.content { min-width: 0; }
 
-.tab-panel { display: none; }
-.tab-panel.is-active { display: block; animation: tab-in 0.22s var(--ease); }
+.view-panel { display: none; }
+.view-panel.is-active { display: block; animation: tab-in 0.22s var(--ease); }
 @keyframes tab-in {
   from { opacity: 0; transform: translateY(5px); }
   to { opacity: 1; transform: none; }
@@ -1323,8 +1374,16 @@ input:disabled { opacity: 0.6; }
   h1 { font-size: 21px; }
   .kc-stats { grid-template-columns: minmax(0, 1fr); }
   .kc-wins { grid-column: 1 / -1; grid-row: 2; }
-  .tab { padding: 10px 12px; font-size: 12.5px; }
-  .tabs { margin-bottom: 14px; }
+  .shell { gap: 18px; }
+  .sidebar {
+    position: static;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(252px, 1fr);
+    grid-template-columns: none;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
 }
 
 @media (max-width: 720px) {
@@ -1523,6 +1582,19 @@ input:disabled { opacity: 0.6; }
 .wb-fact b { font-size: 12.5px; color: var(--ink-2); font-weight: 600; }
 
 .wb-note { font-size: 11.5px; color: var(--warn); }
+.wb-logs {
+  margin: 12px 0 0;
+  padding: 12px 14px;
+  max-height: 300px;
+  overflow: auto;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-2);
+  font: 400 11.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .wb-pkgs {
   display: flex;
   flex-direction: column;
@@ -1602,6 +1674,20 @@ input:disabled { opacity: 0.6; }
 @media (max-width: 720px) {
   .wb-card-tags { margin-left: 0; justify-content: flex-start; }
   .wb-card-title small { max-width: 100%; }
+}
+
+/* 侧边栏在窄屏塌成横向一条，可横向滑动 */
+@media (max-width: 1180px) {
+  .shell { grid-template-columns: minmax(0, 1fr); }
+  .sidebar {
+    position: static;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(252px, 1fr);
+    grid-template-columns: none;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .sidebar::-webkit-scrollbar { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

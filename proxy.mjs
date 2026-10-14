@@ -34,6 +34,8 @@ const WB_DEFAULTS = {
   enabled: true,
   hubUrl: 'http://127.0.0.1:8788',
   hubPanelPassword: '',
+  // 对外出口 /wb/v1/* 转发到 hub 时注入的 key。hub 只认自己的 key，调用方不必关心它。
+  hubApiKey: '',
   upstreamUrl: 'http://127.0.0.1:7863',
   managerUrl: 'http://127.0.0.1:7864',
 };
@@ -92,6 +94,7 @@ function loadConfig() {
   if (process.env.CC_HOST_LABEL) defaults.hostLabel = process.env.CC_HOST_LABEL;
   if (process.env.WB_HUB_URL) defaults.workbuddy.hubUrl = process.env.WB_HUB_URL;
   if (process.env.WB_HUB_PANEL_PASSWORD) defaults.workbuddy.hubPanelPassword = process.env.WB_HUB_PANEL_PASSWORD;
+  if (process.env.WB_HUB_API_KEY) defaults.workbuddy.hubApiKey = process.env.WB_HUB_API_KEY;
   if (process.env.WB_UPSTREAM_URL) defaults.workbuddy.upstreamUrl = process.env.WB_UPSTREAM_URL;
   if (process.env.WB_MANAGER_URL) defaults.workbuddy.managerUrl = process.env.WB_MANAGER_URL;
   if (process.env.WB_DISABLED === '1') defaults.workbuddy.enabled = false;
@@ -4911,6 +4914,10 @@ const WB_FORWARD = {
   '/workbuddy/credits': '/accounts/credits',
   '/workbuddy/analytics': '/usage/analytics',
   '/workbuddy/remaining': '/usage/remaining',
+  '/workbuddy/schedule': '/scheduler',
+  '/workbuddy/schedule/trigger': '/scheduler/trigger',
+  '/workbuddy/schedule/toggle': '/scheduler/toggle',
+  '/workbuddy/tasks': '/tasks',
   '/workbuddy/realm': '/realm',
   '/workbuddy/usage': '/usage/analytics',
   '/workbuddy/login/start': '/accounts/login/start',
@@ -4990,6 +4997,61 @@ async function handleWorkbuddy(req, res, path, url) {
     return sendJSON(res, r.ok ? 200 : (r.status || 502), r.data ?? { ok: r.ok });
   } catch (e) {
     return sendJSON(res, 502, { error: { message: 'WorkBuddy hub 不可达：' + e.message, type: 'upstream_error' } });
+  }
+}
+
+/** 原始请求体（出口要原样转发，不能像 wbReadJson 那样 parse 再序列化） */
+async function wbReadRawBody(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  return Buffer.concat(chunks);
+}
+
+/* ── WorkBuddy 对外出口 ────────────────────────────────────
+   /wb/v1/* 原样转发到 hub 的 /v1/*，并把 hub 自己的 key 注进去（hub 只认自己的 key，
+   调用方不必关心它）。
+
+   与 CC 的 /v1/* 完全独立 —— 那边是站点渠道正在用的出口，一个字节都不动。
+   逐块透传、不缓冲，否则 SSE 流会被憋住。 */
+async function handleWorkbuddyEgress(req, res, url) {
+  const cfg = WB();
+  if (!cfg.enabled) {
+    return sendJSON(res, 503, { error: { message: 'WorkBuddy 出口已关闭', type: 'server_busy' } });
+  }
+  // /wb/v1/chat/completions -> /v1/chat/completions
+  const target = `${cfg.hubUrl}${url.pathname.replace(/^\/wb/, '')}${url.search || ''}`;
+
+  const headers = {};
+  for (const h of ['content-type', 'accept', 'accept-language']) {
+    if (req.headers[h]) headers[h] = req.headers[h];
+  }
+  if (cfg.hubApiKey) headers['Authorization'] = `Bearer ${cfg.hubApiKey}`;
+
+  let body;
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    body = await wbReadRawBody(req);
+  }
+
+  const ac = new AbortController();
+  const onClose = () => ac.abort();
+  res.once('close', onClose);
+  try {
+    const upstream = await fetch(target, { method: req.method, headers, body, signal: ac.signal });
+    const out = { 'Content-Type': upstream.headers.get('content-type') || 'application/json' };
+    const cc = upstream.headers.get('cache-control');
+    if (cc) out['Cache-Control'] = cc;
+    res.writeHead(upstream.status, out);
+    if (!upstream.body) { res.end(); return; }
+    for await (const chunk of upstream.body) {
+      // 下游写不动就等它 drain，别把上游读爆
+      if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+    }
+    res.end();
+  } catch (e) {
+    if (res.headersSent) { try { res.end(); } catch { /* 已经断开 */ } }
+    else sendJSON(res, 502, { error: { message: 'WorkBuddy hub 不可达：' + e.message, type: 'upstream_error' } });
+  } finally {
+    res.removeListener('close', onClose);
   }
 }
 
@@ -5278,6 +5340,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // WorkBuddy 对外出口。刻意放在 CC 的 /v1/* 之前且路径完全分开：
+    // 站点渠道正在打 /v1/*，那条链路不能受这里影响。
+    if (url.pathname === '/wb/v1' || url.pathname.startsWith('/wb/v1/')) {
+      await handleWorkbuddyEgress(req, res, url);
+      return;
+    }
+
     // 管理面板与 Key 池 API
     if (url.pathname.startsWith('/admin/api/') || url.pathname === '/admin/api') {
       await handleAdminApi(req, res, url);

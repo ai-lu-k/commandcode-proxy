@@ -72,93 +72,168 @@
 
   <div class="page">
 
-    <!-- ── 概览（所有标签页共用） ───────────────────────────── -->
-    <section class="hero">
-      <div class="hero-head">
-        <div>
-          <h1>Key 池管理</h1>
-          <p class="lede">多 Key 负载均衡 · 额度查询 · 灵活调度</p>
+    <div class="shell">
+      <!-- ── 侧边栏：一级按数据源分组 ─────────────────────────── -->
+      <aside class="sidebar" id="sidebar" aria-label="数据源与分区">
+        <div class="side-group">
+          <div class="side-head">
+            <span class="side-logo tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-shield"/></svg></span>
+            <div class="side-title">
+              <b>Command Code</b>
+              <small id="ccSideSub">api.commandcode.ai</small>
+            </div>
+          </div>
+          <nav class="side-nav">
+            <button class="side-item" type="button" data-view="cc/keys">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-key"/></svg>
+              <span>Key 池</span>
+              <b class="side-count" id="tabKeysCount">0</b>
+            </button>
+            <button class="side-item" type="button" data-view="cc/routing">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sliders"/></svg>
+              <span>调度与轮询</span>
+              <i class="side-dot" id="tabRouteDot" hidden aria-hidden="true"></i>
+            </button>
+            <button class="side-item" type="button" data-view="cc/sessions">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-share"/></svg>
+              <span>会话</span>
+              <b class="side-count" id="tabSessionsCount">0</b>
+            </button>
+            <button class="side-item" type="button" data-view="cc/alerts">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-alert"/></svg>
+              <span>告警</span>
+              <b class="side-count" id="tabAlertsCount" hidden>0</b>
+            </button>
+          </nav>
         </div>
-        <span class="hero-badge tone-idle" id="poolBadge">
-          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-shield"/></svg>
-          <span id="poolBadgeText">正在加载…</span>
-        </span>
-      </div>
 
-      <div class="kpis">
-        <article class="kpi">
-          <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg></span>
-          <div class="kpi-body">
-            <span class="kpi-label">Key 总数</span>
-            <strong id="statTotal">—</strong>
-            <span class="kpi-sub" id="statTotalSub">池内全部凭证</span>
+        <div class="side-group">
+          <div class="side-head">
+            <span class="side-logo tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-robot"/></svg></span>
+            <div class="side-title">
+              <b>WorkBuddy</b>
+              <small id="wbSideSub">www.workbuddy.ai</small>
+            </div>
           </div>
-        </article>
-        <article class="kpi">
-          <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
-          <div class="kpi-body">
-            <span class="kpi-label">可用 Key</span>
-            <strong id="statUsable">—</strong>
-            <span class="kpi-sub" id="statUsableSub">参与请求分发</span>
-          </div>
-        </article>
-        <article class="kpi">
-          <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
-          <div class="kpi-body">
-            <span class="kpi-label">剩余额度合计</span>
-            <strong id="statCredits">—</strong>
-            <span class="kpi-sub" id="statCreditsSub">尚未查询额度</span>
-          </div>
-        </article>
-        <article class="kpi">
-          <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
-          <div class="kpi-body">
-            <span class="kpi-label">活跃会话</span>
-            <strong id="statSessions">—</strong>
-            <span class="kpi-sub" id="statSessionsSub">—</span>
-          </div>
-        </article>
-      </div>
-    </section>
+          <nav class="side-nav">
+            <button class="side-item" type="button" data-view="wb/accounts">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-credits"/></svg>
+              <span>账号池</span>
+              <b class="side-count" id="tabWorkbuddyCount" hidden>0</b>
+            </button>
+            <button class="side-item" type="button" data-view="wb/schedule">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-clock"/></svg>
+              <span>调度与轮询</span>
+              <i class="side-dot" id="tabWbSchedDot" hidden aria-hidden="true"></i>
+            </button>
+          </nav>
+        </div>
+      </aside>
 
-    <!-- ── 标签页导航 ───────────────────────────────────────── -->
-    <nav class="tabs" id="tabs" role="tablist" aria-label="管理分区">
-      <button class="tab is-active" type="button" role="tab" data-tab="keys"
-        id="tabBtnKeys" aria-selected="true" aria-controls="panel-keys">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-key"/></svg>
-        <span>Key 池</span>
-        <b class="tab-count" id="tabKeysCount">0</b>
-      </button>
-      <button class="tab" type="button" role="tab" data-tab="routing"
-        id="tabBtnRouting" aria-selected="false" aria-controls="panel-routing" tabindex="-1">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-sliders"/></svg>
-        <span>调度与轮询</span>
-        <i class="tab-dot" id="tabRouteDot" hidden aria-hidden="true"></i>
-      </button>
-      <button class="tab" type="button" role="tab" data-tab="sessions"
-        id="tabBtnSessions" aria-selected="false" aria-controls="panel-sessions" tabindex="-1">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-share"/></svg>
-        <span>会话</span>
-        <b class="tab-count" id="tabSessionsCount">0</b>
-      </button>
-      <button class="tab" type="button" role="tab" data-tab="alerts"
-        id="tabBtnAlerts" aria-selected="false" aria-controls="panel-alerts" tabindex="-1">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-alert"/></svg>
-        <span>告警</span>
-        <b class="tab-count" id="tabAlertsCount" hidden>0</b>
-      </button>
-      <button class="tab" type="button" role="tab" data-tab="workbuddy"
-        id="tabBtnWorkbuddy" aria-selected="false" aria-controls="panel-workbuddy" tabindex="-1">
-        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-robot"/></svg>
-        <span>WorkBuddy</span>
-        <b class="tab-count" id="tabWorkbuddyCount" hidden>0</b>
-      </button>
-    </nav>
+      <div class="content">
 
-    <main class="main">
+        <!-- ── 数据源 1 概览：Command Code ───────────────────────── -->
+        <section class="hero" data-source="cc">
+          <div class="hero-head">
+            <div>
+              <h1>Command Code</h1>
+              <p class="lede">多 Key 负载均衡 · 额度查询 · 灵活调度</p>
+            </div>
+            <span class="hero-badge tone-idle" id="poolBadge">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-shield"/></svg>
+              <span id="poolBadgeText">正在加载…</span>
+            </span>
+          </div>
+
+          <div class="kpis">
+            <article class="kpi">
+              <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-key"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">Key 总数</span>
+                <strong id="statTotal">—</strong>
+                <span class="kpi-sub" id="statTotalSub">池内全部凭证</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">可用 Key</span>
+                <strong id="statUsable">—</strong>
+                <span class="kpi-sub" id="statUsableSub">参与请求分发</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">剩余额度合计</span>
+                <strong id="statCredits">—</strong>
+                <span class="kpi-sub" id="statCreditsSub">尚未查询额度</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">活跃会话</span>
+                <strong id="statSessions">—</strong>
+                <span class="kpi-sub" id="statSessionsSub">—</span>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <!-- ── 数据源 2 概览：WorkBuddy ──────────────────────────── -->
+        <section class="hero" data-source="wb" hidden>
+          <div class="hero-head">
+            <div>
+              <h1>WorkBuddy</h1>
+              <p class="lede">腾讯 CodeBuddy 账号池 · 双区域（国际版 / 国内版）</p>
+            </div>
+            <span class="hero-badge tone-idle" id="wbBadge">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-robot"/></svg>
+              <span id="wbBadgeText">正在加载…</span>
+            </span>
+          </div>
+
+          <div class="kpis">
+            <article class="kpi">
+              <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-robot"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">WorkBuddy 账号</span>
+                <strong id="wbStatAccounts">—</strong>
+                <span class="kpi-sub" id="wbStatAccountsSub">总 / 可用</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">积分剩余 / 总量</span>
+                <strong id="wbStatCredits">—</strong>
+                <span class="kpi-sub" id="wbStatCreditsSub">上游只读快照</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">请求数</span>
+                <strong id="wbStatReqs">—</strong>
+                <span class="kpi-sub" id="wbStatReqsSub">窗口 / 累计</span>
+              </div>
+            </article>
+            <article class="kpi">
+              <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
+              <div class="kpi-body">
+                <span class="kpi-label">Token 用量</span>
+                <strong id="wbStatTokens">—</strong>
+                <span class="kpi-sub" id="wbStatTokensSub">窗口 / 累计</span>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <main class="main">
 
       <!-- ══ 标签页 1：Key 池 ══════════════════════════════════ -->
-      <section class="tab-panel is-active" id="panel-keys" data-panel="keys" role="tabpanel" aria-labelledby="tabBtnKeys">
+      <section class="view-panel is-active" id="panel-keys" data-view="cc/keys" role="tabpanel" aria-label="Command Code · Key 池">
         <div class="layout">
           <div class="col-main">
             <section class="panel keys-panel">
@@ -243,7 +318,7 @@
       </section>
 
       <!-- ══ 标签页 2：调度与轮询 ══════════════════════════════ -->
-      <section class="tab-panel" id="panel-routing" data-panel="routing" role="tabpanel" aria-labelledby="tabBtnRouting" hidden>
+      <section class="view-panel" id="panel-routing" data-view="cc/routing" role="tabpanel" aria-label="Command Code · 调度与轮询" hidden>
         <div class="grid-panels">
           <section class="panel">
             <div class="panel-head">
@@ -368,7 +443,7 @@
       </section>
 
       <!-- ══ 标签页 3：会话 ════════════════════════════════════ -->
-      <section class="tab-panel" id="panel-sessions" data-panel="sessions" role="tabpanel" aria-labelledby="tabBtnSessions" hidden>
+      <section class="view-panel" id="panel-sessions" data-view="cc/sessions" role="tabpanel" aria-label="Command Code · 会话" hidden>
         <section class="panel">
           <div class="panel-head">
             <div class="panel-title">
@@ -390,7 +465,7 @@
       </section>
 
       <!-- ══ 标签页 4：告警 ════════════════════════════════════ -->
-      <section class="tab-panel" id="panel-alerts" data-panel="alerts" role="tabpanel" aria-labelledby="tabBtnAlerts" hidden>
+      <section class="view-panel" id="panel-alerts" data-view="cc/alerts" role="tabpanel" aria-label="Command Code · 告警" hidden>
         <div class="grid-panels">
           <section class="panel">
             <div class="panel-head">
@@ -631,42 +706,7 @@
       </section>
 
       <!-- ══ 标签页 5：WorkBuddy ═══════════════════════════════ -->
-      <section class="tab-panel" id="panel-workbuddy" data-panel="workbuddy" role="tabpanel" aria-labelledby="tabBtnWorkbuddy" hidden>
-        <div class="kpis wb-kpis">
-          <article class="kpi">
-            <span class="kpi-icon tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-robot"/></svg></span>
-            <div class="kpi-body">
-              <span class="kpi-label">WorkBuddy 账号</span>
-              <strong id="wbStatAccounts">—</strong>
-              <span class="kpi-sub" id="wbStatAccountsSub">总 / 可用</span>
-            </div>
-          </article>
-          <article class="kpi">
-            <span class="kpi-icon tone-cyan" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-credits"/></svg></span>
-            <div class="kpi-body">
-              <span class="kpi-label">积分剩余 / 总量</span>
-              <strong id="wbStatCredits">—</strong>
-              <span class="kpi-sub" id="wbStatCreditsSub">上游只读快照</span>
-            </div>
-          </article>
-          <article class="kpi">
-            <span class="kpi-icon tone-green" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
-            <div class="kpi-body">
-              <span class="kpi-label">请求数</span>
-              <strong id="wbStatReqs">—</strong>
-              <span class="kpi-sub" id="wbStatReqsSub">窗口 / 累计</span>
-            </div>
-          </article>
-          <article class="kpi">
-            <span class="kpi-icon tone-amber" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-sliders"/></svg></span>
-            <div class="kpi-body">
-              <span class="kpi-label">Token 用量</span>
-              <strong id="wbStatTokens">—</strong>
-              <span class="kpi-sub" id="wbStatTokensSub">窗口 / 累计</span>
-            </div>
-          </article>
-        </div>
-
+      <section class="view-panel" id="panel-workbuddy" data-view="wb/accounts" role="tabpanel" aria-label="WorkBuddy · 账号池" hidden>
         <div class="layout">
           <div class="col-main">
             <section class="panel">
@@ -742,7 +782,69 @@
         </div>
       </section>
 
+      <!-- ══ WorkBuddy · 调度与轮询 ══════════════════════════════ -->
+      <section class="view-panel" id="panel-wb-schedule" data-view="wb/schedule" role="tabpanel" aria-label="WorkBuddy · 调度与轮询" hidden>
+        <div class="layout">
+          <div class="col-main">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-clock"/></svg></span>
+                  <div>
+                    <h2>后台定时调度</h2>
+                    <p class="hint">hub 的签到 / 猫猫旅行 / 活跃上报 / Token 保活排程。国际版与国内版的排程不同。</p>
+                  </div>
+                </div>
+                <div class="panel-tools">
+                  <button id="wbSchedTrigger" class="btn ghost sm" type="button" title="立刻跑一轮巡检，不用等下一个整点">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                    <span class="btn-label">立即巡检</span>
+                  </button>
+                  <button id="wbSchedRefresh" class="btn ghost sm" type="button">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                    <span class="btn-label">刷新</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="switch-list">
+                <label class="sw">
+                  <input type="checkbox" id="wbSchedEnabled" />
+                  <span class="track" aria-hidden="true"></span>
+                  <span class="sw-text"><b>启用后台调度器</b><small>关闭后所有定时任务（签到 / 保活 / 活跃）都会停</small></span>
+                </label>
+              </div>
+
+              <div class="wb-facts" id="wbSchedFacts"></div>
+              <pre class="wb-logs" id="wbSchedLogs">加载中…</pre>
+            </section>
+          </div>
+
+          <aside class="side">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-check-circle"/></svg></span>
+                  <div>
+                    <h2>账号任务</h2>
+                    <p class="hint">每个账号当前的签到 / 任务状态。</p>
+                  </div>
+                </div>
+              </div>
+              <div id="wbTaskList" class="wb-pkgs"></div>
+              <p id="wbTaskEmpty" class="empty hidden">
+                <span class="empty-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-inbox"/></svg></span>
+                <b>暂无任务数据</b>
+                <span id="wbTaskMsg">—</span>
+              </p>
+            </section>
+          </aside>
+        </div>
+      </section>
+
     </main>
+      </div>
+    </div>
 
     <footer class="foot">
       <span class="foot-left">
