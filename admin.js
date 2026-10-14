@@ -518,7 +518,7 @@
   }
 
   /* ── 标签页 ──────────────────────────────────────────── */
-  const TABS = ['keys', 'routing', 'sessions', 'alerts'];
+  const TABS = ['keys', 'routing', 'sessions', 'alerts', 'workbuddy'];
   const TAB_STORE_KEY = 'cc-proxy-tab';
 
   function setTab(name, { save = true } = {}) {
@@ -543,6 +543,7 @@
     }
     if (t === 'sessions') refreshSessions();
     if (t === 'alerts') refreshAlerts();
+    if (t === 'workbuddy') refreshWorkbuddy();
   }
 
   function initialTab() {
@@ -588,6 +589,13 @@
       const n = (state.alerts?.active || []).length;
       alertCount.textContent = String(n);
       alertCount.hidden = !n;
+    }
+    // WorkBuddy 标签显示账号池大小
+    const wbCount = $('#tabWorkbuddyCount');
+    if (wbCount) {
+      const n = (state.wb?.accounts || []).length;
+      wbCount.textContent = String(n);
+      wbCount.hidden = !n;
     }
   }
 
@@ -1478,6 +1486,189 @@
       toast(err.message, 'err');
     }
   });
+
+  /* ── WorkBuddy（第二套上游，与 CC Key 池无关） ───────────
+     数据全部来自服务端 /admin/api/workbuddy/*：那里替我们登录 hub 面板并持会话令牌，
+     浏览器不接触面板密码，也不用关心 hub 的绝对路径。 */
+  const WB_REALM_TEXT = { intl: '🌐 国际版', cn: '🇨🇳 国内版' };
+  let wbLoginState = null;
+  let wbLoginTimer = null;
+  let wbFetching = false;
+
+  function wbSetRealmActive(realm) {
+    $$('#wbRealmSeg .seg').forEach((b) => b.classList.toggle('is-active', b.dataset.realm === realm));
+  }
+
+  function wbBackendRow(title, sub, b) {
+    const on = !!b?.up;
+    return `<div class="wb-backend">
+        <span class="wb-dot ${on ? 'on' : 'off'}" aria-hidden="true"></span>
+        <div class="wb-backend-main"><b>${escapeHtml(title)}</b><small>${escapeHtml(sub)}</small></div>
+        <span class="wb-backend-tag ${on ? 'on' : 'off'}">${on ? '在线' : '离线'}</span>
+      </div>`;
+  }
+
+  function renderWbBackends(status) {
+    const el = $('#wbBackends');
+    if (!el) return;
+    const hub = status?.hub || {};
+    const hd = hub.data || {};
+    const up = status?.upstream || {};
+    const mgr = status?.manager || {};
+    const accounts = hd.accounts ?? '—';
+    const ready = hd.accounts_ready ?? '—';
+    el.innerHTML = [
+      wbBackendRow('网关 hub', `${hub.url || '—'} · 账号 ${accounts} / 可用 ${ready}`, hub),
+      wbBackendRow('Go 上游', `${up.url || '—'} · 账号 ${up.data?.total ?? '—'}`, up),
+      wbBackendRow('账号控制台', mgr.url || '—', mgr),
+    ].join('');
+    if (hd.realm) wbSetRealmActive(hd.realm);
+    const hint = $('#wbRealmHint');
+    if (hint) {
+      const bits = [];
+      if (hd.realm) bits.push('当前出口 ' + (WB_REALM_TEXT[hd.realm] || hd.realm));
+      if (status && status.panelReady === false) bits.push('未配置 hub 面板密码 → 账号列表不可读');
+      hint.textContent = bits.join(' · ');
+    }
+  }
+
+  function renderWbAccounts() {
+    const wrap = $('#wbAccountList');
+    const empty = $('#wbEmpty');
+    if (!wrap) return;
+    const rows = state.wb?.accounts || [];
+    if (!rows.length) {
+      wrap.innerHTML = '';
+      if (empty) empty.classList.remove('hidden');
+      return;
+    }
+    if (empty) empty.classList.add('hidden');
+    wrap.innerHTML = rows.map((a) => {
+      const nick = a.nickname || a.name || a.email || a.uid || '—';
+      const realm = a.realm || a.region || '—';
+      const usable = a.usable ?? a.ready ?? a.enabled;
+      const credits = a.credits ?? a.credit ?? a.remaining;
+      const product = a.product || a.client || '';
+      return `<div class="wb-account">
+          <span class="wb-dot ${usable ? 'on' : 'off'}" aria-hidden="true"></span>
+          <div class="wb-account-main">
+            <b>${escapeHtml(String(nick))}</b>
+            <small>${escapeHtml(String(a.uid || a.id || ''))}</small>
+          </div>
+          <div class="wb-account-meta">
+            ${product ? `<span class="wb-chip">${escapeHtml(String(product))}</span>` : ''}
+            <span class="wb-chip">${escapeHtml(String(realm))}</span>
+            ${credits != null ? `<span class="wb-chip">额度 ${escapeHtml(String(credits))}</span>` : ''}
+            <span class="wb-chip ${usable ? 'ok' : 'bad'}">${usable ? '可用' : '不可用'}</span>
+          </div>
+        </div>`;
+    }).join('');
+  }
+
+  async function refreshWorkbuddy() {
+    if (wbFetching) return;
+    wbFetching = true;
+    state.wb = state.wb || {};
+    try {
+      const status = await api('/admin/api/workbuddy/status');
+      state.wb.status = status;
+      renderWbBackends(status);
+      try {
+        const list = await api('/admin/api/workbuddy/accounts');
+        state.wb.accounts = Array.isArray(list) ? list : (list?.accounts || []);
+      } catch (e) {
+        state.wb.accounts = [];
+        const hint = $('#wbRealmHint');
+        if (hint) hint.textContent = '账号列表读取失败：' + e.message;
+      }
+      renderWbAccounts();
+      renderTabBadges();
+    } catch (e) {
+      toast('WorkBuddy 状态读取失败：' + e.message, 'err');
+    } finally {
+      wbFetching = false;
+    }
+  }
+
+  function wbCloseLogin() {
+    if (wbLoginTimer) { clearInterval(wbLoginTimer); wbLoginTimer = null; }
+    wbLoginState = null;
+    const p = $('#wbLoginPanel');
+    if (p) p.hidden = true;
+  }
+
+  async function wbPollLogin() {
+    if (!wbLoginState) return;
+    const box = $('#wbLoginBox');
+    const statusEl = box && box.querySelector('.wb-login-status');
+    try {
+      const r = await api('/admin/api/workbuddy/login/poll?state=' + encodeURIComponent(wbLoginState));
+      if (statusEl) statusEl.textContent = r.message || r.status || '等待授权…';
+      if (r.status === 'ok') {
+        const who = (r.account && (r.account.nickname || r.account.uid)) || '账号已入池';
+        toast('登录成功：' + who);
+        wbCloseLogin();
+        await refreshWorkbuddy();
+      } else if (r.status === 'error' || r.status === 'expired' || r.status === 'unknown') {
+        wbCloseLogin();
+        toast('授权未完成：' + (r.message || r.status), 'err');
+      }
+    } catch { /* 下一轮再试 */ }
+  }
+
+  async function wbStartLogin() {
+    const realm = state.wb?.status?.hub?.data?.realm || 'intl';
+    const panel = $('#wbLoginPanel');
+    const box = $('#wbLoginBox');
+    if (panel) panel.hidden = false;
+    if (box) box.innerHTML = '<p class="wb-login-status">正在向腾讯申请授权…</p>';
+    try {
+      const r = await api('/admin/api/workbuddy/login/start', {
+        method: 'POST',
+        body: JSON.stringify({ platform: 'CLI', realm }),
+      });
+      wbLoginState = r.state;
+      if (box) {
+        box.innerHTML = `
+            <p class="wb-login-status">${escapeHtml(r.message || '在浏览器里完成授权，本页会自动检测。')}</p>
+            <a class="btn primary sm wb-login-link" href="${escapeHtml(r.authUrl || '#')}" target="_blank" rel="noopener">打开授权页</a>
+            <div class="wb-login-actions">
+              <button class="btn ghost sm" type="button" id="wbCopyLogin">复制链接</button>
+              <button class="btn ghost sm" type="button" id="wbCancelLogin">取消</button>
+            </div>`;
+        $('#wbCopyLogin').addEventListener('click', async () => {
+          const ok = await copyText(r.authUrl || '');
+          toast(ok ? '链接已复制' : '复制失败，请手动选择', ok ? 'ok' : 'err');
+        });
+        $('#wbCancelLogin').addEventListener('click', async () => {
+          try { await api('/admin/api/workbuddy/login/cancel', { method: 'POST', body: '{}' }); } catch { /* 忽略 */ }
+          wbCloseLogin();
+        });
+      }
+      if (wbLoginTimer) clearInterval(wbLoginTimer);
+      wbLoginTimer = setInterval(wbPollLogin, 2500);
+    } catch (e) {
+      if (box) box.innerHTML = `<p class="wb-login-status">发起失败：${escapeHtml(e.message)}</p>`;
+    }
+  }
+
+  async function wbSetRealm(realm) {
+    try {
+      await api('/admin/api/workbuddy/realm', { method: 'POST', body: JSON.stringify({ realm }) });
+      toast('出口已切到 ' + (WB_REALM_TEXT[realm] || realm));
+      wbSetRealmActive(realm);
+      await refreshWorkbuddy();
+    } catch (e) {
+      toast('切换失败：' + e.message, 'err');
+    }
+  }
+
+  $('#wbRealmSeg').addEventListener('click', (e) => {
+    const b = e.target.closest('.seg[data-realm]');
+    if (b) wbSetRealm(b.dataset.realm);
+  });
+  $('#wbRefresh').addEventListener('click', () => refreshWorkbuddy());
+  $('#wbAddAccount').addEventListener('click', () => wbStartLogin());
 
   // 点击卡片空白处不触发任何操作，但 Enter 在按钮上由浏览器原生处理
   setTab(initialTab(), { save: false });

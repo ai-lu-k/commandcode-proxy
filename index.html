@@ -33,6 +33,7 @@
     <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7.2h9.4M18.4 7.2H20M4 16.8h4.6M13.6 16.8H20"/><circle cx="16" cy="7.2" r="2.3"/><circle cx="11.2" cy="16.8" r="2.3"/></symbol>
     <symbol id="i-inbox" viewBox="0 0 24 24"><path d="M3.4 13h4.2l1.5 3h5.8l1.5-3h4.2"/><path d="M6.3 4.4h11.4l3.3 8.6v6.8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-6.8Z"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 21.6s7.6-3.7 7.6-9.4V5.6L12 2.6 4.4 5.6v6.6c0 5.7 7.6 9.4 7.6 9.4Z"/><path d="m9.2 11.9 2 2 3.7-3.9"/></symbol>
+    <symbol id="i-robot" viewBox="0 0 24 24"><rect x="4.2" y="7.6" width="15.6" height="11.6" rx="3.4"/><path d="M12 3.2v4.4"/><circle cx="12" cy="2.9" r="1.2"/><path d="M9.1 12.3v1.9M14.9 12.3v1.9"/><path d="M9.4 16.5h5.2"/></symbol>
   </svg>
 
   <!-- ── 顶栏 ───────────────────────────────────────────────── -->
@@ -145,6 +146,12 @@
         <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-alert"/></svg>
         <span>告警</span>
         <b class="tab-count" id="tabAlertsCount" hidden>0</b>
+      </button>
+      <button class="tab" type="button" role="tab" data-tab="workbuddy"
+        id="tabBtnWorkbuddy" aria-selected="false" aria-controls="panel-workbuddy" tabindex="-1">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-robot"/></svg>
+        <span>WorkBuddy</span>
+        <b class="tab-count" id="tabWorkbuddyCount" hidden>0</b>
       </button>
     </nav>
 
@@ -620,6 +627,79 @@
             <div id="alertActive" class="alert-active"></div>
             <div id="alertHistory" class="alert-history"></div>
           </section>
+        </div>
+      </section>
+
+      <!-- ══ 标签页 5：WorkBuddy ═══════════════════════════════ -->
+      <section class="tab-panel" id="panel-workbuddy" data-panel="workbuddy" role="tabpanel" aria-labelledby="tabBtnWorkbuddy" hidden>
+        <div class="layout">
+          <div class="col-main">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-robot"/></svg></span>
+                  <div>
+                    <h2>WorkBuddy 账号池</h2>
+                    <p class="hint">腾讯 WorkBuddy / CodeBuddy 反代网关，与上面的 Command Code Key 池各自独立。扫码授权后账号自动入池。</p>
+                  </div>
+                </div>
+                <div class="panel-tools">
+                  <button id="wbRefresh" class="btn ghost sm" type="button">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-refresh"/></svg>
+                    <span class="btn-label">刷新</span>
+                  </button>
+                  <button id="wbAddAccount" class="btn primary sm" type="button">
+                    <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>
+                    <span class="btn-label">添加账号</span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="wb-bar">
+                <span class="wb-bar-label">出口区域</span>
+                <div class="segmented" id="wbRealmSeg" role="group" aria-label="切换出口区域">
+                  <button class="seg" type="button" data-realm="intl">🌐 国际版</button>
+                  <button class="seg" type="button" data-realm="cn">🇨🇳 国内版</button>
+                </div>
+                <span class="wb-bar-hint" id="wbRealmHint"></span>
+              </div>
+
+              <div id="wbAccountList" class="wb-list"></div>
+              <p id="wbEmpty" class="empty hidden">
+                <span class="empty-icon" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-inbox"/></svg></span>
+                <b>还没有 WorkBuddy 账号</b>
+                <span>点右上角「添加账号」，浏览器会打开腾讯授权页；授权完成后账号自动入库。</span>
+              </p>
+            </section>
+          </div>
+
+          <aside class="side">
+            <section class="panel">
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-shield"/></svg></span>
+                  <div>
+                    <h2>后端状态</h2>
+                    <p class="hint">本机 loopback 上的三个 WorkBuddy 组件。</p>
+                  </div>
+                </div>
+              </div>
+              <div id="wbBackends" class="wb-backends"></div>
+            </section>
+
+            <section class="panel" id="wbLoginPanel" hidden>
+              <div class="panel-head">
+                <div class="panel-title">
+                  <span class="pi" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-share"/></svg></span>
+                  <div>
+                    <h2>正在授权</h2>
+                    <p class="hint">在浏览器里完成腾讯登录，本页会自动检测。</p>
+                  </div>
+                </div>
+              </div>
+              <div id="wbLoginBox" class="wb-login"></div>
+            </section>
+          </aside>
         </div>
       </section>
 

@@ -7,5 +7,12 @@
   "logFile": "",
   "logLevel": "info",
   "zdr": false,
-  "upstreamProxy": ""
+  "upstreamProxy": "",
+  "workbuddy": {
+    "enabled": true,
+    "hubUrl": "http://127.0.0.1:8788",
+    "hubPanelPassword": "",
+    "upstreamUrl": "http://127.0.0.1:7863",
+    "managerUrl": "http://127.0.0.1:7864"
+  }
 }

@@ -23,6 +23,21 @@ import {
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// ── WorkBuddy 集成默认值 ──────────────────────────────
+// WorkBuddy（腾讯 CodeBuddy）是与 Command Code 完全独立的第二套上游，跑在同一台机器
+// 的 loopback 上。三个组件：
+//   hub      127.0.0.1:8788  Python 网关，自带账号池 / 用量 / 定价（数据源）
+//   upstream 127.0.0.1:7863  Go 纯 API 网关，无界面，由 manager 纳管
+//   manager  127.0.0.1:7864  账号池控制台
+// 管理面板只跟 hub 要数据：它的面板 API 最全，且 /panel/login 能换来会话令牌。
+const WB_DEFAULTS = {
+  enabled: true,
+  hubUrl: 'http://127.0.0.1:8788',
+  hubPanelPassword: '',
+  upstreamUrl: 'http://127.0.0.1:7863',
+  managerUrl: 'http://127.0.0.1:7864',
+};
+
 function loadConfig() {
   const defaults = {
     port: 3000,
@@ -42,6 +57,7 @@ function loadConfig() {
     upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
     adminUrl: '',                 // 告警邮件里附的管理台地址，如 https://ai.lu-k.cn/proxy/
     hostLabel: '',                // 告警邮件里的主机标识（留空用容器/机器主机名）
+    workbuddy: { ...WB_DEFAULTS }, // WorkBuddy 第二套上游，见上方 WB_DEFAULTS
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -53,6 +69,10 @@ function loadConfig() {
       console.error('[config] Failed to parse config.json:', e.message);
     }
   }
+
+  // workbuddy 是嵌套对象：Object.assign 是浅拷贝，config.json 里只写一个字段就会把
+  // 其余默认值一起抹掉，所以这里再浅合并一次兜底。
+  defaults.workbuddy = { ...WB_DEFAULTS, ...(defaults.workbuddy || {}) };
 
   // 环境变量覆写
   if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
@@ -70,6 +90,11 @@ function loadConfig() {
   if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
   if (process.env.CC_ADMIN_URL) defaults.adminUrl = process.env.CC_ADMIN_URL;
   if (process.env.CC_HOST_LABEL) defaults.hostLabel = process.env.CC_HOST_LABEL;
+  if (process.env.WB_HUB_URL) defaults.workbuddy.hubUrl = process.env.WB_HUB_URL;
+  if (process.env.WB_HUB_PANEL_PASSWORD) defaults.workbuddy.hubPanelPassword = process.env.WB_HUB_PANEL_PASSWORD;
+  if (process.env.WB_UPSTREAM_URL) defaults.workbuddy.upstreamUrl = process.env.WB_UPSTREAM_URL;
+  if (process.env.WB_MANAGER_URL) defaults.workbuddy.managerUrl = process.env.WB_MANAGER_URL;
+  if (process.env.WB_DISABLED === '1') defaults.workbuddy.enabled = false;
 
   return defaults;
 }
@@ -4797,8 +4822,148 @@ function currentLbConfig() {
   };
 }
 
+/* ── WorkBuddy 桥接 ────────────────────────────────────────
+   管理台只跟 hub 要数据。hub 的管理端点（/accounts、/usage、/realm…）不认 API Key，
+   只认 X-Panel-Token —— 那是 POST /panel/login 用面板密码换来的会话令牌。所以这里
+   在服务端登录一次、缓存令牌，遇到 401/403 再重登一次。
+
+   为什么不让浏览器直接打 hub：hub 的看板用的是绝对路径（/api/...），挂在子路径下
+   会打到站点根上去；而且面板密码不该落到浏览器。走服务端代理两个问题一起解决。 */
+
+const WB = () => CFG.workbuddy || WB_DEFAULTS;
+const WB_PANEL_TOKEN_TTL = 6 * 60 * 60 * 1000;
+let wbPanelToken = '';
+let wbPanelTokenAt = 0;
+
+/** 读 JSON 请求体；空体返回 {}（hub 的 /accounts/login/start 就是空 POST） */
+async function wbReadJson(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const raw = Buffer.concat(chunks).toString().trim();
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function wbFetchRaw(url, { method = 'GET', body, headers = {}, timeoutMs = 12000 } = {}) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json', ...headers },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: ac.signal,
+    });
+    const text = await res.text();
+    let data = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+    return { ok: res.ok, status: res.status, data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function wbHubLogin() {
+  const pw = WB().hubPanelPassword;
+  if (!pw) throw new Error('未配置 workbuddy.hubPanelPassword（config.json 或 WB_HUB_PANEL_PASSWORD）');
+  const r = await wbFetchRaw(`${WB().hubUrl}/panel/login`, { method: 'POST', body: { password: pw } });
+  if (!r.ok || !r.data?.token) {
+    throw new Error(r.data?.error?.message || `hub 面板登录失败 (HTTP ${r.status})`);
+  }
+  wbPanelToken = r.data.token;
+  wbPanelTokenAt = Date.now();
+  return wbPanelToken;
+}
+
+/** 调 hub 面板 API；令牌缺失/过期或 401 时重登一次 */
+async function wbHub(path, opts = {}) {
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!wbPanelToken || Date.now() - wbPanelTokenAt > WB_PANEL_TOKEN_TTL) await wbHubLogin();
+    last = await wbFetchRaw(`${WB().hubUrl}${path}`, {
+      ...opts,
+      headers: { 'X-Panel-Token': wbPanelToken, ...(opts.headers || {}) },
+    });
+    if (last.status === 401 || last.status === 403) { wbPanelToken = ''; continue; }
+    return last;
+  }
+  return last;
+}
+
+/** 探活：任何异常都收敛成 { up:false }，绝不让一个后端挂掉拖垮整个状态接口。
+    判定「在线」用的是「拿到了一个可解析的 JSON 响应」而不是 2xx —— Go 上游在
+    没有可用账号时就用 503 + JSON 如实报告降级，那属于在线但暂不可服务。 */
+async function wbProbe(base, path) {
+  try {
+    const r = await wbFetchRaw(`${base}${path}`, { timeoutMs: 4000 });
+    const jsonOk = !!r.data && typeof r.data === 'object' && !('raw' in r.data);
+    return { up: r.status > 0 && (r.ok || jsonOk), status: r.status, data: r.data };
+  } catch (e) {
+    return { up: false, status: 0, error: e.name === 'AbortError' ? 'timeout' : e.message };
+  }
+}
+
+/** 只读转发映射：面板路径 → hub 路径 */
+const WB_FORWARD = {
+  '/workbuddy/accounts': '/accounts',
+  '/workbuddy/realm': '/realm',
+  '/workbuddy/usage': '/usage/analytics',
+  '/workbuddy/login/start': '/accounts/login/start',
+  '/workbuddy/login/poll': '/accounts/login/poll',
+  '/workbuddy/login/cancel': '/accounts/login/cancel',
+  '/workbuddy/accounts/refresh': '/accounts/refresh',
+};
+
+async function handleWorkbuddy(req, res, path, url) {
+  if (!WB().enabled) {
+    return sendJSON(res, 503, { error: { message: 'WorkBuddy 集成已在配置里关闭', type: 'server_busy' } });
+  }
+
+  // 三组件总览。hub 的 /health 不需要令牌，所以即使面板密码没配也看得到账号数。
+  if (path === '/workbuddy/status') {
+    const [hub, upstream, manager] = await Promise.all([
+      wbProbe(WB().hubUrl, '/health'),
+      wbProbe(WB().upstreamUrl, '/healthz'),
+      wbProbe(WB().managerUrl, '/api/healthz'),
+    ]);
+    return sendJSON(res, 200, {
+      hub: { url: WB().hubUrl, ...hub },
+      upstream: { url: WB().upstreamUrl, ...upstream },
+      manager: { url: WB().managerUrl, ...manager },
+      panelReady: !!WB().hubPanelPassword,
+    });
+  }
+
+  const hubPath = WB_FORWARD[path];
+  if (!hubPath) {
+    return sendJSON(res, 404, { error: { message: 'Unknown workbuddy endpoint: ' + path, type: 'not_found' } });
+  }
+
+  const qs = url.search || '';
+  let body;
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    body = await wbReadJson(req);
+    if (body === null) {
+      return sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    }
+  }
+
+  try {
+    const r = await wbHub(hubPath + qs, { method: req.method, body });
+    // hub 的错误体就是 OpenAI 风格，原样透出，前端能直接显示 message
+    return sendJSON(res, r.ok ? 200 : (r.status || 502), r.data ?? { ok: r.ok });
+  } catch (e) {
+    return sendJSON(res, 502, { error: { message: 'WorkBuddy hub 不可达：' + e.message, type: 'upstream_error' } });
+  }
+}
+
 async function handleAdminApi(req, res, url) {
   const path = url.pathname.replace(/^\/admin\/api/, '') || '/';
+
+  // WorkBuddy 第二套上游（与下面的 Command Code Key 池无关）
+  if (path === '/workbuddy' || path.startsWith('/workbuddy/')) {
+    return handleWorkbuddy(req, res, path, url);
+  }
 
   if (path === '/lb') {
     if (req.method === 'GET') return sendJSON(res, 200, currentLbConfig());
