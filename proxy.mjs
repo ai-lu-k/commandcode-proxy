@@ -5058,6 +5058,59 @@ async function handleWorkbuddyEgress(req, res, url) {
 async function handleAdminApi(req, res, url) {
   const path = url.pathname.replace(/^\/admin\/api/, '') || '/';
 
+  // 首页的数据源目录。刻意**只放静态元信息**（上游、出口路径、备注）：
+  // 实时状态由前端从各源已有的接口拼，两个地方不各存一份真相；以后加一个新源
+  // 也只需要动这里一处。
+  if (path === '/overview' && req.method === 'GET') {
+    return sendJSON(res, 200, {
+      sources: [
+        {
+          id: 'cc',
+          name: 'Command Code',
+          subtitle: '本机 Key 池 · 多 Key 负载均衡',
+          icon: 'shield',
+          tone: 'violet',
+          upstream: CFG.apiBase,
+          entry: 'cc/keys',
+          entryLabel: '进入 Key 池',
+          note: '站点渠道 1 / 2 / 12 正在使用这套出口，接口路径不可变更。',
+          egress: {
+            internal: 'http://commandcode-proxy-proxy-1:3050/v1',
+            prefix: '/v1',
+            endpoints: [
+              'POST /v1/chat/completions',
+              'POST /v1/messages',
+              'POST /v1/responses',
+              'GET  /v1/models',
+              'POST /provider/v1/systemone',
+            ],
+          },
+        },
+        {
+          id: 'wb',
+          name: 'WorkBuddy',
+          subtitle: '腾讯 CodeBuddy · 双区域账号池',
+          icon: 'robot',
+          tone: 'cyan',
+          upstream: 'www.workbuddy.ai · copilot.tencent.com',
+          entry: 'wb/accounts',
+          entryLabel: '进入账号池',
+          note: '与 Command Code 完全独立的账号池；出口是新加的，尚未接站点渠道。',
+          egress: {
+            internal: 'http://commandcode-proxy-proxy-1:3050/wb/v1',
+            prefix: '/wb/v1',
+            endpoints: [
+              'POST /wb/v1/chat/completions',
+              'POST /wb/v1/messages',
+              'POST /wb/v1/responses',
+              'GET  /wb/v1/models',
+            ],
+          },
+        },
+      ],
+    });
+  }
+
   // WorkBuddy 第二套上游（与下面的 Command Code Key 池无关）
   if (path === '/workbuddy' || path.startsWith('/workbuddy/')) {
     return handleWorkbuddy(req, res, path, url);

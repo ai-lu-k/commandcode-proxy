@@ -528,7 +528,7 @@
     keys: 'cc/keys', routing: 'cc/routing', sessions: 'cc/sessions', alerts: 'cc/alerts',
     workbuddy: 'wb/accounts',
   };
-  const FALLBACK_VIEW = 'cc/keys';
+  const FALLBACK_VIEW = 'home';
 
   function allViews() {
     return $$('.side-item[data-view]').map((b) => b.dataset.view);
@@ -572,6 +572,7 @@
     }
 
     // 各视图按需拉自己的数据，切过去才请求
+    if (v === 'home') refreshOverview();
     if (v === 'cc/sessions') refreshSessions();
     if (v === 'cc/alerts') refreshAlerts();
     // 只要进了某个数据源，就把它那套 KPI 刷新一遍（两套 KPI 不再共用一块）
@@ -580,12 +581,11 @@
   }
 
   function initialView() {
+    // 显式带上 hash 才深链到具体分区；否则一律落首页。
+    // 这里刻意**不读** localStorage 的"上次位置"：`/proxy/admin` 就是这个面板的
+    // 门面地址，打开它看到的应该是总览，而不是某人上次停留的子页。
     const fromHash = normalizeView(location.hash);
     if (fromHash) return fromHash;
-    try {
-      const saved = normalizeView(localStorage.getItem(VIEW_STORE_KEY));
-      if (saved) return saved;
-    } catch { /* 忽略 */ }
     return FALLBACK_VIEW;
   }
 
@@ -1185,6 +1185,7 @@
       fillSettings(data.settings, data.creditsRefresh);
       $('#apiBase').textContent = data.apiBase || 'api';
       $('#apiBase').title = data.apiBase || 'api';
+      state.apiBase = data.apiBase || '';
       renderAll();
       renderSessions();
       if (state.view === 'cc/alerts') await refreshAlerts();
@@ -1960,6 +1961,122 @@
       wbSchedFetching = false;
     }
   }
+
+  /* ── 概览首页 ────────────────────────────────────────────
+     数据源目录来自服务端 /admin/api/overview（以后加一个新源只改后端一处），
+     实时状态则从各源**已有的**接口现拼 —— 两个地方不各存一份真相。 */
+  let overviewFetchedAt = 0;
+
+  function dsStatus(id) {
+    if (id === 'cc') {
+      const keys = state.keys || [];
+      const usable = keys.filter(isUsableClient).length;
+      const synced = keys.filter((k) => k.credits && !k.credits.error);
+      const sum = synced.reduce((s, k) => s + (k.credits?.creditsRemaining || 0), 0);
+      return {
+        up: keys.length > 0,
+        label: keys.length ? (usable ? '在线' : '无可用 Key') : '未配置',
+        stats: [
+          ['Key 池', `${keys.length} 个 · ${usable} 可用`],
+          ['剩余额度', synced.length ? fmtNum(sum) : '—'],
+          ['活跃会话', String((state.sessions || []).length)],
+        ],
+      };
+    }
+    const rows = state.wb?.accounts || [];
+    const st = state.wb?.status || {};
+    const hubUp = !!st.hub?.up;
+    const parts = [st.hub?.up, st.upstream?.up, st.manager?.up];
+    const upCount = parts.filter(Boolean).length;
+    let remain = 0, size = 0;
+    rows.forEach((a) => {
+      if (!a.credits) return;
+      remain += Number(a.credits.remain) || 0;
+      size += Number(a.credits.size) || 0;
+    });
+    return {
+      up: hubUp,
+      label: hubUp ? (upCount === 3 ? '在线' : `${upCount}/3 组件`) : '不可用',
+      stats: [
+        ['账号池', `${rows.length} 个 · ${state.wb?.usable ?? '—'} 可用`],
+        ['积分', `${wbNum(remain)} / ${wbNum(size)}`],
+        ['组件', `${upCount}/3 在线`],
+      ],
+    };
+  }
+
+  function renderOverview() {
+    const grid = $('#dsGrid');
+    if (!grid) return;
+    const sources = state.overview?.sources || [];
+    grid.innerHTML = sources.map((s) => {
+      const st = dsStatus(s.id);
+      const endpoints = (s.egress?.endpoints || [])
+        .map((e) => `<code class="ds-ep">${escapeHtml(e)}</code>`)
+        .join('');
+      return `<article class="ds-card">
+          <header class="ds-head">
+            <span class="side-logo tone-${escapeHtml(s.tone || 'violet')}" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-${escapeHtml(s.icon || 'key')}"/></svg></span>
+            <div class="ds-title">
+              <b>${escapeHtml(s.name)}</b>
+              <small>${escapeHtml(s.subtitle || '')}</small>
+            </div>
+            <span class="ds-state ${st.up ? 'ok' : 'bad'}"><i aria-hidden="true"></i>${escapeHtml(st.label)}</span>
+          </header>
+
+          <div class="ds-kpis">
+            ${st.stats.map(([k, v]) => `<div class="wb-fact"><span>${escapeHtml(k)}</span><b>${escapeHtml(v)}</b></div>`).join('')}
+          </div>
+
+          <dl class="ds-meta">
+            <dt>上游</dt><dd>${escapeHtml(s.upstream || '—')}</dd>
+            <dt>内网出口</dt><dd><code>${escapeHtml(s.egress?.internal || '—')}</code></dd>
+            <dt>接口</dt><dd class="ds-eps">${endpoints || '<code class="ds-ep">—</code>'}</dd>
+          </dl>
+
+          <footer class="ds-foot">
+            <span class="ds-note">${escapeHtml(s.note || '')}</span>
+            <button class="btn ghost sm" type="button" data-goto="${escapeHtml(s.entry)}">${escapeHtml(s.entryLabel || '进入')} →</button>
+          </footer>
+        </article>`;
+    }).join('');
+
+    const badge = $('#dsBadge');
+    const badgeText = $('#dsBadgeText');
+    if (badge && badgeText) {
+      const total = sources.length;
+      const up = sources.filter((s) => dsStatus(s.id).up).length;
+      badge.classList.remove('tone-ok', 'tone-warn', 'tone-idle');
+      badge.classList.add(total && up === total ? 'tone-ok' : 'tone-warn');
+      badgeText.textContent = `${up}/${total} 个数据源在线`;
+    }
+  }
+
+  async function refreshOverview() {
+    if (!state.overview) {
+      try {
+        state.overview = await api('/admin/api/overview');
+      } catch (e) {
+        toast('数据源目录读取失败：' + e.message, 'err');
+        return;
+      }
+    }
+    renderOverview();
+    // 状态数字要现拉；节流一下，别每次切回首页都全量重取
+    if (Date.now() - overviewFetchedAt > 30000) {
+      overviewFetchedAt = Date.now();
+      await Promise.all([
+        reload({ silent: true }).catch(() => {}),
+        refreshWorkbuddy().catch(() => {}),
+      ]);
+      renderOverview();
+    }
+  }
+
+  $('#dsGrid').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-goto]');
+    if (btn) setView(btn.dataset.goto);
+  });
 
   $('#wbRealmSeg').addEventListener('click', (e) => {
     const b = e.target.closest('.seg[data-realm]');

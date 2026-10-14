@@ -75,6 +75,15 @@
     <div class="shell">
       <!-- ── 侧边栏：一级按数据源分组 ─────────────────────────── -->
       <aside class="sidebar" id="sidebar" aria-label="数据源与分区">
+        <div class="side-group side-group-plain">
+          <nav class="side-nav">
+            <button class="side-item" type="button" data-view="home">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-star"/></svg>
+              <span>概览</span>
+            </button>
+          </nav>
+        </div>
+
         <div class="side-group">
           <div class="side-head">
             <span class="side-logo tone-violet" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="#i-shield"/></svg></span>
@@ -131,6 +140,20 @@
       </aside>
 
       <div class="content">
+
+        <!-- ── 概览首页 ──────────────────────────────────────────── -->
+        <section class="hero" data-source="home" hidden>
+          <div class="hero-head">
+            <div>
+              <h1>数据源总览</h1>
+              <p class="lede">当前接入的全部上游 · 运行状态 · 对外接口地址</p>
+            </div>
+            <span class="hero-badge tone-idle" id="dsBadge">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-star"/></svg>
+              <span id="dsBadgeText">正在加载…</span>
+            </span>
+          </div>
+        </section>
 
         <!-- ── 数据源 1 概览：Command Code ───────────────────────── -->
         <section class="hero" data-source="cc">
@@ -233,7 +256,13 @@
         <main class="main">
 
       <!-- ══ 标签页 1：Key 池 ══════════════════════════════════ -->
-      <section class="view-panel is-active" id="panel-keys" data-view="cc/keys" role="tabpanel" aria-label="Command Code · Key 池">
+      <!-- ══ 概览首页 ═══════════════════════════════════════════ -->
+      <section class="view-panel" id="panel-home" data-view="home" role="tabpanel" aria-label="数据源总览" hidden>
+        <div class="ds-grid" id="dsGrid"></div>
+      </section>
+
+      <!-- ══ 数据源 1 · Key 池 ══════════════════════════════════ -->
+      <section class="view-panel" id="panel-keys" data-view="cc/keys" role="tabpanel" aria-label="Command Code · Key 池" hidden>
         <div class="layout">
           <div class="col-main">
             <section class="panel keys-panel">

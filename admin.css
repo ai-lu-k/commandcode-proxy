@@ -1676,6 +1676,82 @@ input:disabled { opacity: 0.6; }
   .wb-card-title small { max-width: 100%; }
 }
 
+/* ── 概览首页：数据源卡片 ────────────────────────────────── */
+.side-group-plain { background: transparent; border-style: dashed; }
+.ds-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(430px, 1fr));
+  gap: 16px;
+}
+.ds-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+.ds-head { display: flex; align-items: center; gap: 11px; }
+.ds-title { min-width: 0; display: grid; gap: 2px; }
+.ds-title b { font-size: 15px; color: var(--ink); letter-spacing: -0.01em; }
+.ds-title small { font-size: 11.5px; color: var(--muted); }
+.ds-state {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--r-full);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+.ds-state i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex: none; }
+.ds-state.ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 36%, transparent);
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+}
+.ds-state.bad {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 36%, transparent);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.ds-kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.ds-meta { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 0; }
+.ds-meta dt { font-size: 11.5px; color: var(--faint); white-space: nowrap; }
+.ds-meta dd { margin: 0; font-size: 12.5px; color: var(--ink-2); min-width: 0; word-break: break-word; }
+.ds-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+.ds-eps { display: flex; flex-wrap: wrap; gap: 5px; }
+.ds-ep { white-space: nowrap; }
+.ds-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+.ds-note { flex: 1; min-width: 180px; font-size: 11.5px; color: var(--faint); line-height: 1.6; }
+
+@media (max-width: 720px) {
+  .ds-kpis { grid-template-columns: minmax(0, 1fr); }
+  .ds-meta { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
+
 /* 侧边栏在窄屏塌成横向一条，可横向滑动 */
 @media (max-width: 1180px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
