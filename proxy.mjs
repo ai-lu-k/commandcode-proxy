@@ -5406,49 +5406,64 @@ function wbCrossRealmError(text) {
 }
 
 /* ── 上游错误脱敏 ──────────────────────────────────────────
-   hub 的报错原文里带了两类不该进客户端的东西：
-     ① 内部诊断：8 位账号 UID + 每个账号的熔断/冷却剩余时间（pool_unavailable_detail
-        拼在「no usable account」后面），这是纯内部状态；
-     ② 上游应答原文：采购链接、内部错误码（如 14018 Credits exhausted）。
-   客户端只需要一句能行动的话；原文进服务端日志和 recent 环（那里是排查现场）。
+   对外只给一句通用话术。调用方不需要知道中转站后面是账号池、是哪一版出口、余额够不够、
+   上游是不是在限流 —— 线上被连着指出两轮：先是账号 UID，后是「账号池 / 上游账号冷却」
+   这种字样。凡是描述后端结构的词（账号池、上游、出口、渠道、积分、加量包、冷却、限流、
+   realm、hub）都不该出现在客户端可见的报文里。
 
-   顺带纠一个误导：上游明说「积分耗尽」时 hub 把它归成了「限流」（14018 不是它的
-   6004 限额码），客户端会拿到假的 "rate limit"。这里按真实原因回。 */
+   只有「请求本身有问题」这一类保留具体说明 —— 它与后端结构无关，不说清楚调用方没法改。
+
+   具体原因一律留在服务端：日志 + recent 环（那里存原文，是排查现场）。
+   映射表最后一条是 catch-all：以后上游冒出新错误也不会漏出去。 */
+const WB_UNAVAILABLE = '暂时不可用，请稍后重试';
+
 const WB_ERROR_RULES = [
-  [/no usable account|all are disabled|no healthy account/i,
-    'WorkBuddy 账号池暂时没有可用账号（上游账号冷却中），请稍后重试'],
-  // 与积分耗尽短路共用同一个判据，避免「客户端看到的原因」和「出口跳过的原因」漂移
-  [WB_CREDITS_RE, 'WorkBuddy 账号积分已用完，该模型需要购买加量包才能继续使用'],
-  [/concurrent chat limit/i, 'WorkBuddy 上游并发已满，请稍后重试'],
-  [/frequency limit|rate limit/i, 'WorkBuddy 上游限流，请稍后重试'],
-  [/service info not found|11102/i, '该模型在当前出口不可用'],
-  [/只在国际版提供|只在国内版提供|only available on the (international|domestic)/i,
-    '该模型不在当前出口提供，请改用对应出口的渠道'],
-  [/content reject|content policy|content review/i, '请求内容被上游内容审核拒绝'],
-  [/session.*(not found|expired)|凭证已过期/i, 'WorkBuddy 账号登录态已过期'],
-  [/context length|prompt too long|too many tokens|maximum context/i,
-    '请求超出模型上下文上限，请减少历史消息或附件'],
+  // 调用方能自己改的：说清楚才有用
+  [/invalid request parameters|11133|invalid_image_data|11135/i,
+    '请求参数未被接受，请检查消息格式后重试'],
+  [/context length|context_length|prompt too long|too many tokens|maximum context/i,
+    '请求超出模型上下文上限，请减少历史消息或附件后重试'],
+  [/content reject|content policy|content review/i, '请求内容未通过审核，请调整后重试'],
+  // 其余（池子里没号、额度耗尽、限流、走错版本、登录态过期、模型缺失…）一律通用话术。
+  // WB_CREDITS_RE 仍然用于「积分耗尽短路」的判据，只是不再把这句话讲给客户端。
+  [/.+/, WB_UNAVAILABLE],
 ];
 
-/** 上游的非 2xx 错误体 → 一句可行动的话（无匹配时按状态给通用句）。 */
+/** 按状态给一个不暴露后端的类型名（OpenAI 那几个标准值）。 */
+function wbErrorType(status) {
+  if (status === 429) return 'rate_limit_error';
+  if (status === 401 || status === 403) return 'authentication_error';
+  if (status >= 400 && status < 500) return 'invalid_request_error';
+  return 'server_error';
+}
+
+/** 上游的非 2xx 错误体 → 一句通用话术（原文只进日志与 recent 环）。 */
 function wbSanitizeError(status, rawBody) {
   const body = String(rawBody || '');
-  let message = `WorkBuddy 上游错误（HTTP ${status}）`;
+  let message = WB_UNAVAILABLE;
   for (const [re, msg] of WB_ERROR_RULES) {
     if (re.test(body)) { message = msg; break; }
   }
-  return JSON.stringify({ error: { message, type: 'upstream_error', code: status } });
+  return JSON.stringify({ error: { message, type: wbErrorType(status), code: status } });
 }
 
 // 透传流（2xx / 不识别的响应体）里的可识别泄漏标记：命中才处理，没命中原样放行。
-const WB_LEAK_MARKERS = ['各账号：', 'account for realm', 'add or enable one at the dashboard'];
+const WB_LEAK_MARKERS = [
+  '各账号：', 'account for realm', 'add or enable one at the dashboard',
+  'no usable account', 'upstream rate limit reached', 'Credits exhausted', 'insufficient credit',
+];
 
-/** 把透传文本里的账号池内部诊断抹掉；原文照旧进服务端的 recent 环。 */
+/** 把透传文本里的后端内部诊断抹掉；原文照旧进服务端的 recent 环。 */
 function wbScrubText(text) {
   let t = String(text);
   // 「；各账号：<uid> 熔断 剩余 43 min，…」整段是内部状态
   t = t.replace(/；各账号：[^"\\]*/g, '');
   t = t.replace(/\s*-\s*add or enable one at the dashboard \(?\/\)?/gi, '');
+  // 上游/池子的原话也换掉（同一个理由：客户端不该看到后端结构）
+  t = t.replace(/no usable account for realm '[a-z]+'[^"\\]*/gi, WB_UNAVAILABLE);
+  t = t.replace(/all are disabled, cooling down[^"\\]*/gi, '');
+  t = t.replace(/upstream rate limit reached for this model[^"\\]*/gi, WB_UNAVAILABLE);
+  t = t.replace(/credits? exhausted[^"\\]*/gi, WB_UNAVAILABLE);
   return t;
 }
 
@@ -5514,7 +5529,7 @@ async function handleWorkbuddyEgress(req, res, url) {
   const cfg = WB();
   if (!cfg.enabled) {
     wbDiag('disabled');
-    return sendJSON(res, 503, { error: { message: 'WorkBuddy 出口已关闭', type: 'server_busy' } });
+    return sendJSON(res, 503, { error: { message: WB_UNAVAILABLE, type: 'server_error' } });
   }
   // /wb/v1/chat/completions -> /v1/chat/completions
   const upstreamPath = url.pathname.replace(/^\/wb/, '');
@@ -5543,8 +5558,9 @@ async function handleWorkbuddyEgress(req, res, url) {
       // 服务：退回隐式渠道会把同一个版本又用起来，开关等于没有。站点收到 503 会自动
       // 换到另一个端口（另一个版本）。
       wbDiag('noPlan');
+      // 对外同样是通用话术：不说是哪个版本、也不说被谁停用
       return sendJSON(res, 503, {
-        error: { message: `WorkBuddy ${exitRealm || ''} 出口已停用`, type: 'server_busy' },
+        error: { message: WB_UNAVAILABLE, type: 'server_error' },
         retry_after: 30,
       });
     }
@@ -5690,23 +5706,23 @@ async function handleWorkbuddyEgress(req, res, url) {
     }
   }
 
-  // 所有渠道都被积分耗尽挡下（一次都没真发出去）：这不是「上游坏了」，
-  // 回 429 + 明确原因，别让客户端去猜也别让它一直重试。
+  // 所有渠道都被积分耗尽挡下（一次都没真发出去）：对外还是通用话术，
+  // 原因（哪个模型、还剩几分钟）只在服务端的日志与 recent 环里。
   if (!res.headersSent && creditParkedAll > 0 && !lastStatus && !lastError) {
-    return sendJSON(res, 429, {
-      error: {
-        message: `WorkBuddy 账号积分已用完，该模型需要购买加量包才能继续使用（约 ${Math.ceil(creditParkedAll / 60000)} 分钟后自动重试）`,
-        type: 'insufficient_quota',
-      },
+    log('warn', 'WorkBuddy 全部出口都因积分耗尽被跳过', {
+      model, minutes: Math.ceil(creditParkedAll / 60000),
+    });
+    return sendJSON(res, 503, {
+      error: { message: WB_UNAVAILABLE, type: 'server_error' },
+      retry_after: Math.max(1, Math.ceil(creditParkedAll / 1000)),
     });
   }
 
   if (!res.headersSent) {
+    // 兜底也不透任何后端细节：lastError 里可能是 hub 地址、状态码之类
+    if (lastError) log('warn', 'WorkBuddy 出口全部失败', { model, lastError, lastStatus });
     sendJSON(res, 502, {
-      error: {
-        message: lastError || `WorkBuddy 所有渠道都不可用（最后状态 ${lastStatus || '—'}）`,
-        type: 'upstream_error',
-      },
+      error: { message: WB_UNAVAILABLE, type: 'server_error' },
     });
   }
 }
@@ -6118,7 +6134,7 @@ async function handleRequest(req, res) {
   const exitList = wbExits();
   const onExit2 = exitList.length > 1 && Number(req.socket?.localPort) === exitList[1].port;
   if (onExit2 && url.pathname !== '/health' && url.pathname !== '/wb' && !url.pathname.startsWith('/wb/')) {
-    sendJSON(res, 404, { error: { message: 'Not found on this exit port', type: 'not_found' } });
+    sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     return;
   }
 

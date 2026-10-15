@@ -13,6 +13,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 慢渠道的首字延迟；阈值设得比它低一点点，好让「慢」这件事确定发生
 const SLOW_MS = 1500;
 const CHAT = { model: 'deepseek-v4.1-flash', messages: [{ role: 'user', content: 'hi' }] };
+// 客户端可见的报文里绝不能出现的字眼 —— 后端结构（账号池 / 上游 / 出口 / 渠道 / hub /
+// realm）、计费内部（积分 / 加量包）、以及「WorkBuddy」这个上游厂商名。
+// 线上被连着指出两轮（先账号 UID，后「账号池 · 上游账号冷却」），这里立成硬约束：
+// 对外只说「暂时不可用」，凡描述后端结构的一律不许出现。
+const LEAKY = /账号池|上游|出口|渠道|积分|加量包|冷却|限流|熔断|hub|realm|workbuddy/i;
 
 test('渠道池：轮询 / 熔断 / 重试 / 手动开关 / 阈值落盘', async (t) => {
   const fast = await startMockUpstream({
@@ -339,20 +344,23 @@ test('上游错误脱敏：账号池内部诊断不进客户端，原文只留�
     try { rmSync(workdir, { recursive: true, force: true }); } catch {}
   });
 
-  await t.test('503 的账号池诊断被换成一句可行动的话', async () => {
+  await t.test('503 的后端诊断收敛成一句通用话术', async () => {
     const r = await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
     assert.equal(r.status, 503, '状态码照旧，只换 message');
     const j = await r.json();
-    assert.ok(!/71c0a6c6|7cc904d4|a18de4d2|6c355136|91157b10/.test(JSON.stringify(j)), '不得出现账号 UID');
-    assert.ok(!/各账号|add or enable one|dashboard/.test(JSON.stringify(j)), '不得出现池子状态');
-    assert.match(j.error.message, /账号池暂时没有可用账号/);
+    const wire = JSON.stringify(j);
+    assert.ok(!/71c0a6c6|7cc904d4|a18de4d2|6c355136|91157b10/.test(wire), '不得出现账号 UID');
+    assert.ok(!/各账号|add or enable one|dashboard/.test(wire), '不得出现池子状态');
+    assert.ok(!LEAKY.test(wire), `不得出现后端字样：${wire}`);
+    assert.match(j.error.message, /暂时不可用/);
+    assert.equal(j.error.type, 'server_error');
     // 原文要留在服务端的 recent 环里（排查现场）
     const v = await (await proxy.get('/admin/api/wb/channels')).json();
     const last = (v.recent || [])[v.recent.length - 1];
     assert.ok(last && /71c0a6c6/.test(last.err || ''), '服务端 recent 环保留原文');
   });
 
-  await t.test('14018「积分耗尽」按真实原因回，不再伪装成限流', async () => {
+  await t.test('14018「积分耗尽」对外也只是「暂时不可用」', async () => {
     const mock2 = await startMockUpstream({
       onRequest: (req, res) => {
         res.writeHead(429, { 'Content-Type': 'application/json' });
@@ -369,8 +377,11 @@ test('上游错误脱敏：账号池内部诊断不进客户端，原文只留�
       const r = await p2.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
       assert.equal(r.status, 429);
       const j = await r.json();
-      assert.match(j.error.message, /积分已用完/, '要说真话：积分耗尽，不是限流');
-      assert.ok(!/rate limit|Please visit the link/.test(JSON.stringify(j)), '不透传上游原文与采购链接');
+      const wire = JSON.stringify(j);
+      assert.match(j.error.message, /暂时不可用/);
+      assert.ok(!LEAKY.test(wire), `不得出现后端字样：${wire}`);
+      assert.ok(!/14018|Credits exhausted|Please visit the link|rate limit/i.test(wire), '不透传上游原文与采购链接');
+      assert.equal(j.error.type, 'rate_limit_error');
     } finally {
       await p2.kill();
       await mock2.close();
@@ -400,6 +411,7 @@ test('上游错误脱敏：账号池内部诊断不进客户端，原文只留�
       assert.equal(r.status, 200);
       const text = await r.text();
       assert.ok(!/71c0a6c6|各账号/.test(text), '流里的账号诊断不得下发');
+      assert.ok(!LEAKY.test(text), `流里也不得出现后端字样：${text.slice(0, 200)}`);
       assert.ok(text.includes('"text":"hello"'), '正常内容必须原样通过');
       assert.ok(text.includes('"type":"finish"'), '正常的流事件不能被洗坏');
     } finally {
@@ -451,21 +463,26 @@ test('积分耗尽短路：同一个模型不再空转上游，换模型不受�
     try { rmSync(workdir, { recursive: true, force: true }); } catch {}
   });
 
-  await t.test('第一次：把上游的「积分耗尽」如实回给客户端', async () => {
+  await t.test('第一次：上游说积分耗尽，对外仍是「暂时不可用」', async () => {
     const r = await proxy.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
-    assert.equal(r.status, 429);
+    assert.equal(r.status, 429, '状态码照旧，只换 message');
     const j = await r.json();
-    assert.ok(!/rate limit|14018|Please visit/i.test(JSON.stringify(j)), '不再伪装成限流，也不透传上游原文');
-    assert.match(j.error.message, /积分已用完/);
+    const wire = JSON.stringify(j);
+    assert.ok(!/rate limit|14018|Credits exhausted|Please visit/i.test(wire), '不透传上游原文与采购链接');
+    assert.ok(!LEAKY.test(wire), `不得出现后端字样：${wire}`);
+    assert.match(j.error.message, /暂时不可用/);
     assert.equal(calls, 1);
   });
 
-  await t.test('第二次：直接短路，不再打上游', async () => {
+  await t.test('第二次：直接短路回 503，不再打上游', async () => {
     const before = calls;
     const r = await proxy.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
-    assert.equal(r.status, 429);
+    assert.equal(r.status, 503);
     const j = await r.json();
-    assert.match(j.error.message, /积分已用完/);
+    const wire = JSON.stringify(j);
+    assert.match(j.error.message, /暂时不可用/);
+    assert.ok(!LEAKY.test(wire), `不得出现后端字样：${wire}`);
+    assert.ok(!/分钟|重试时间|加量包/.test(wire), '不暴露还会被跳过多久');
     assert.equal(calls, before, '不该再打上游一次');
   });
 
