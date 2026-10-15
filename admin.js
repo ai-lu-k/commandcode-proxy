@@ -1703,7 +1703,7 @@
           </div>`
       : '<div class="wb-meter"><div class="wb-meter-sub">尚无额度快照（hub 每 12 小时刷新一次）</div></div>';
 
-    return `<article class="wb-card">
+    return `<article class="wb-card" data-uid="${escapeHtml(uid)}">
         <header class="wb-card-head">
           <span class="wb-dot ${a.enabled === false ? 'off' : 'on'}" aria-hidden="true"></span>
           <div class="wb-card-title">
@@ -1715,6 +1715,13 @@
             ${a.platform ? `<span class="wb-chip">${escapeHtml(String(a.platform))}</span>` : ''}
             ${a.product ? `<span class="wb-chip">${escapeHtml(String(a.product))}</span>` : ''}
             ${wbStatusChips(a)}
+          </div>
+          <div class="wb-ch-acts">
+            <label class="wb-switch" title="停用后 hub 不会把这个账号派出去；与熔断/冷却是独立状态">
+              <input type="checkbox" data-act="enabled" ${a.enabled === false ? '' : 'checked'} />
+              <span>启用</span>
+            </label>
+            <label class="wb-num">权重<input type="number" min="1" max="100" step="1" data-act="weight" value="${Number(a.weight || 1)}" /></label>
           </div>
         </header>
         ${meter}
@@ -2268,6 +2275,37 @@
   $('#wbRefresh').addEventListener('click', () => refreshWorkbuddy());
   $('#wbRefreshCredits').addEventListener('click', () => wbRefreshCredits());
   $('#wbAddAccount').addEventListener('click', () => wbStartLogin());
+
+  // 逐账号开关 / 权重：hub 的 /accounts/set 按 uid 改，改完重新拉一遍列表
+  // （hub 会在响应里回改完后的账号视图，但重拉能顺带把 inCooldown / breaker 一起刷新）
+  const wbAccListEl = $('#wbAccountList');
+  if (wbAccListEl) {
+    const wbAccSet = async (uid, body, okMsg) => {
+      try {
+        await api('/admin/api/workbuddy/accounts/set', {
+          method: 'POST', body: JSON.stringify({ uid, ...body }),
+        });
+        if (okMsg) toast(okMsg);
+      } catch (e) {
+        toast('改不动：' + e.message, 'err');
+      }
+      await refreshWorkbuddy();
+    };
+    wbAccListEl.addEventListener('change', (e) => {
+      const el = e.target.closest('[data-act]');
+      const card = e.target.closest('[data-uid]');
+      if (!el || !card) return;
+      const uid = card.dataset.uid;
+      if (!uid) return;
+      const nick = card.querySelector('.wb-card-title b')?.textContent || uid.slice(0, 8);
+      if (el.dataset.act === 'enabled') {
+        wbAccSet(uid, { enabled: el.checked }, `${nick} 已${el.checked ? '启用' : '停用'}`);
+      } else if (el.dataset.act === 'weight') {
+        const w = parseInt(el.value, 10);
+        if (Number.isFinite(w) && w >= 1 && w <= 100) wbAccSet(uid, { weight: w }, `${nick} 权重已设为 ${w}`);
+      }
+    });
+  }
   $('#wbSchedRefresh').addEventListener('click', () => refreshWbSchedule());
   $('#wbSchedTrigger').addEventListener('click', async () => {
     const btn = $('#wbSchedTrigger');

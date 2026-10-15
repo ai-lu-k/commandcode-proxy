@@ -4991,6 +4991,8 @@ const WB_FORWARD = {
   '/workbuddy/login/poll': '/accounts/login/poll',
   '/workbuddy/login/cancel': '/accounts/login/cancel',
   '/workbuddy/accounts/refresh': '/accounts/refresh',
+  // 单账号改：enabled / weight / note / proxySlot。uid 必填，hub 侧会回 404 未知 uid。
+  '/workbuddy/accounts/set': '/accounts/set',
 };
 
 async function handleWorkbuddy(req, res, path, url) {
