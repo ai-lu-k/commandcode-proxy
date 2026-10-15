@@ -2369,6 +2369,11 @@
       const s = c.stats || {};
       const secs = (v) => (v == null ? '—' : (v < 1000 ? wbNum(v, 0) + 'ms' : wbNum(v / 1000, 1) + 's'));
       const fact = (k, v, cls = '') => `<div class="wb-fact ${cls}"><span>${k}</span><b>${v}</b></div>`;
+      // 积分耗尽的模型被跳过中：这不是「渠道坏了」，是「这个出口这个模型没钱了」
+      const parks = Array.isArray(c.creditParks) ? c.creditParks : [];
+      const parkChip = parks.length
+        ? `<span class="wb-chip trip" title="上游账号在这些模型上积分已用完，请求会直接短路，不再空转上游">${parks.map((p) => `${escapeHtml(p.model)} 积分耗尽 · ${p.minutes} 分`).join('，')}</span>`
+        : '';
       const trip = c.breakerActive
         ? `<span class="wb-chip bad">${c.breaker?.reason === 'errors' ? '连续失败' : '一直很慢'} · 第 ${c.breaker?.strikes || 1} 次 · ${fmtClock(c.breaker?.until)} 放回</span>`
         : (c.breaker ? `<span class="wb-chip">上次熔断 ${fmtClock(c.breaker.at)}</span>` : '');
@@ -2383,6 +2388,7 @@
             <div class="wb-card-tags">
               <span class="wb-chip ${st.cls}">${st.text}</span>
               ${trip}
+              ${parkChip}
               ${s.lastError ? `<span class="wb-chip bad">${escapeHtml(s.lastError)}</span>` : ''}
             </div>
             <div class="wb-ch-acts">
@@ -2393,7 +2399,7 @@
               <label class="wb-num">权重<input type="number" min="1" step="1" data-act="weight" value="${c.weight}" /></label>
               <label class="wb-num">优先级<input type="number" step="1" data-act="priority" value="${c.priority}" /></label>
               <button class="btn ghost sm" type="button" data-act="test">探活</button>
-              <button class="btn ghost sm" type="button" data-act="reset" ${c.breaker ? '' : 'disabled'}>重置熔断</button>
+              <button class="btn ghost sm" type="button" data-act="reset" ${(c.breaker || parks.length) ? '' : 'disabled'}>重置</button>
               <button class="btn ghost sm danger" type="button" data-act="del">删除</button>
             </div>
           </div>
@@ -2441,7 +2447,7 @@
       if (btn.dataset.act === 'reset') {
         try {
           await api(`/admin/api/wb/channels/${encodeURIComponent(id)}/reset`, { method: 'POST', body: '{}' });
-          toast('熔断记录已清空，权重序列恢复');
+          toast('已重置：熔断记录、采样窗口、积分跳过都清空');
         } catch (err) { toast('重置失败：' + err.message, 'err'); }
         return refreshWbChannels();
       }

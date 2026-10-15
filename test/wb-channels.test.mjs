@@ -304,3 +304,195 @@ test('两个端口 = 两个出口：端口定死版本，各走各的', async (t
     assert.equal((await post()).status, 200, '重新启用后要能恢复');
   });
 });
+
+// 上游报错原文里的账号 UID / 熔断剩余时间 / 采购链接不该进客户端 —— 线上真实发生过：
+// hub 的 503 把「71c0a6c6 熔断 剩余 43 min，…」逐账号拼进 message 直接透传了出去。
+test('上游错误脱敏：账号池内部诊断不进客户端，原文只留服务端', async (t) => {
+  const HUB_503 = JSON.stringify({
+    message: "no usable account for realm 'cn': all are disabled, cooling down, "
+      + 'expired or parked by the daily token limit；各账号：71c0a6c6 熔断 剩余 43 min，'
+      + '7cc904d4 熔断 剩余 24 min，a18de4d2 熔断 剩余 3.9 hours，6c355136 熔断 剩余 58 min，'
+      + '91157b10 熔断 剩余 26 min - add or enable one at the dashboard (/)',
+    type: 'server_error', param: '', code: 503,
+  });
+  const HUB_429 = JSON.stringify({
+    error: { message: 'upstream rate limit reached for this model; retry in 2s - '
+      + '{"error":{"data":{"code":14018,"msg":"Credits exhausted. '
+      + 'Please visit the link below to purchase add-on packs"}}}' },
+  });
+
+  const mock = await startMockUpstream({
+    onRequest: (req, res) => {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(HUB_503);
+    },
+  });
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-wbsafe-'));
+  writeFileSync(join(workdir, 'keys.json'), JSON.stringify({
+    lb: {}, settings: {}, keys: [],
+    wbChannels: [{ id: 'c-s', name: '唯一', realm: 'intl', hubUrl: `http://127.0.0.1:${mock.port}`, weight: 1, priority: 0, enabled: true }],
+  }, null, 2));
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: workdir, env: { WB_EXIT2_PORT: '0' } });
+  t.after(async () => {
+    await proxy.kill();
+    await mock.close();
+    try { rmSync(workdir, { recursive: true, force: true }); } catch {}
+  });
+
+  await t.test('503 的账号池诊断被换成一句可行动的话', async () => {
+    const r = await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
+    assert.equal(r.status, 503, '状态码照旧，只换 message');
+    const j = await r.json();
+    assert.ok(!/71c0a6c6|7cc904d4|a18de4d2|6c355136|91157b10/.test(JSON.stringify(j)), '不得出现账号 UID');
+    assert.ok(!/各账号|add or enable one|dashboard/.test(JSON.stringify(j)), '不得出现池子状态');
+    assert.match(j.error.message, /账号池暂时没有可用账号/);
+    // 原文要留在服务端的 recent 环里（排查现场）
+    const v = await (await proxy.get('/admin/api/wb/channels')).json();
+    const last = (v.recent || [])[v.recent.length - 1];
+    assert.ok(last && /71c0a6c6/.test(last.err || ''), '服务端 recent 环保留原文');
+  });
+
+  await t.test('14018「积分耗尽」按真实原因回，不再伪装成限流', async () => {
+    const mock2 = await startMockUpstream({
+      onRequest: (req, res) => {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(HUB_429);
+      },
+    });
+    const workdir2 = mkdtempSync(join(tmpdir(), 'ccp-wb14018-'));
+    writeFileSync(join(workdir2, 'keys.json'), JSON.stringify({
+      lb: {}, settings: {}, keys: [],
+      wbChannels: [{ id: 'c-e', name: '唯一', realm: 'intl', hubUrl: `http://127.0.0.1:${mock2.port}`, weight: 1, priority: 0, enabled: true }],
+    }, null, 2));
+    const p2 = await startProxy({ upstreamPort: mock2.port, cwd: workdir2, env: { WB_EXIT2_PORT: '0' } });
+    try {
+      const r = await p2.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
+      assert.equal(r.status, 429);
+      const j = await r.json();
+      assert.match(j.error.message, /积分已用完/, '要说真话：积分耗尽，不是限流');
+      assert.ok(!/rate limit|Please visit the link/.test(JSON.stringify(j)), '不透传上游原文与采购链接');
+    } finally {
+      await p2.kill();
+      await mock2.close();
+      try { rmSync(workdir2, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  await t.test('2xx 流里内嵌的账号池诊断也会被洗掉', async () => {
+    const leak = JSON.stringify({ type: 'error', error: { message: "no usable account for realm 'cn'；各账号：71c0a6c6 熔断 剩余 43 min" } });
+    const mock3 = await startMockUpstream({
+      onRequest: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('data: {"type":"text-delta","text":"hello"}\n\n');
+        res.write(`data: ${leak}\n\n`);
+        res.write('data: {"type":"finish"}\n\n');
+        res.end();
+      },
+    });
+    const workdir3 = mkdtempSync(join(tmpdir(), 'ccp-wbscrub-'));
+    writeFileSync(join(workdir3, 'keys.json'), JSON.stringify({
+      lb: {}, settings: {}, keys: [],
+      wbChannels: [{ id: 'c-x', name: '唯一', realm: 'intl', hubUrl: `http://127.0.0.1:${mock3.port}`, weight: 1, priority: 0, enabled: true }],
+    }, null, 2));
+    const p3 = await startProxy({ upstreamPort: mock3.port, cwd: workdir3, env: { WB_EXIT2_PORT: '0' } });
+    try {
+      const r = await p3.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
+      assert.equal(r.status, 200);
+      const text = await r.text();
+      assert.ok(!/71c0a6c6|各账号/.test(text), '流里的账号诊断不得下发');
+      assert.ok(text.includes('"text":"hello"'), '正常内容必须原样通过');
+      assert.ok(text.includes('"type":"finish"'), '正常的流事件不能被洗坏');
+    } finally {
+      await p3.kill();
+      await mock3.close();
+      try { rmSync(workdir3, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+// 上游说「这个号在这个模型上没钱了」（intl 回 429 带 code 14018 Credits exhausted）
+// 时，hub 只当普通限流给几秒冷却就继续派同一个号 —— 余额明明用完了还一路打过去。
+// 反代这边自己记住 (出口, 模型)，短路掉后续请求，不再空转上游。
+test('积分耗尽短路：同一个模型不再空转上游，换模型不受影响', async (t) => {
+  const EXHAUSTED = JSON.stringify({
+    error: {
+      message: 'upstream rate limit reached for this model; retry in 2s - '
+        + '{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below"}}}',
+    },
+  });
+  let calls = 0;
+  const byModel = {};
+  const mock = await startMockUpstream({
+    onRequest: (req, res, seen) => {
+      calls++;
+      let m = '';
+      try { m = JSON.parse(seen.raw || '{}').model || ''; } catch { /* 忽略 */ }
+      byModel[m] = (byModel[m] || 0) + 1;
+      // 只有 gpt-6-sol 这个模型在上游没钱了；别的模型照常 200
+      if (m === 'gpt-6-sol') {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(EXHAUSTED);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: {"type":"finish"}\n\n');
+      res.end();
+    },
+  });
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-wbcredit-'));
+  writeFileSync(join(workdir, 'keys.json'), JSON.stringify({
+    lb: {}, settings: {}, keys: [],
+    wbChannels: [{ id: 'c-credit', name: '积分出口', realm: 'intl', hubUrl: `http://127.0.0.1:${mock.port}`, weight: 1, priority: 0, enabled: true }],
+  }, null, 2));
+  const proxy = await startProxy({ upstreamPort: mock.port, cwd: workdir, env: { WB_EXIT2_PORT: '0' } });
+  t.after(async () => {
+    await proxy.kill();
+    await mock.close();
+    try { rmSync(workdir, { recursive: true, force: true }); } catch {}
+  });
+
+  await t.test('第一次：把上游的「积分耗尽」如实回给客户端', async () => {
+    const r = await proxy.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
+    assert.equal(r.status, 429);
+    const j = await r.json();
+    assert.ok(!/rate limit|14018|Please visit/i.test(JSON.stringify(j)), '不再伪装成限流，也不透传上游原文');
+    assert.match(j.error.message, /积分已用完/);
+    assert.equal(calls, 1);
+  });
+
+  await t.test('第二次：直接短路，不再打上游', async () => {
+    const before = calls;
+    const r = await proxy.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
+    assert.equal(r.status, 429);
+    const j = await r.json();
+    assert.match(j.error.message, /积分已用完/);
+    assert.equal(calls, before, '不该再打上游一次');
+  });
+
+  await t.test('面板能看到是哪个模型被跳过', async () => {
+    const v = await (await proxy.get('/admin/api/wb/channels')).json();
+    const c = v.channels.find((x) => x.id === 'c-credit');
+    assert.equal(c.creditParks.length, 1);
+    assert.equal(c.creditParks[0].model, 'gpt-6-sol');
+    assert.ok(c.creditParks[0].minutes >= 9, '默认跳过 10 分钟');
+  });
+
+  await t.test('换模型不受影响（跳过是按模型记的）', async () => {
+    const r = await proxy.post('/wb/v1/chat/completions', { model: 'deepseek-v4.1-flash', messages: [] });
+    assert.equal(r.status, 200, '另一个模型必须正常走通');
+    const c = (await (await proxy.get('/admin/api/wb/channels')).json())
+      .channels.find((x) => x.id === 'c-credit');
+    assert.deepEqual(c.creditParks.map((p) => p.model), ['gpt-6-sol'], '另一个模型不该被一起跳过');
+  });
+
+  await t.test('手动重置可以把跳过清掉，立刻重试', async () => {
+    const before = calls;
+    await fetch(`${proxy.base}/admin/api/wb/channels/c-credit/reset`, { method: 'POST' });
+    const c = (await (await proxy.get('/admin/api/wb/channels')).json())
+      .channels.find((x) => x.id === 'c-credit');
+    assert.deepEqual(c.creditParks, []);
+    const r = await proxy.post('/wb/v1/chat/completions', { model: 'gpt-6-sol', messages: [] });
+    assert.equal(r.status, 429);
+    assert.equal(calls, before + 1, '重置后要重新打上游');
+  });
+});

@@ -5165,8 +5165,52 @@ function normalizeWbChannels(raw) {
 
 function wbChannelStat(id) {
   let s = wbChannelStats.get(id);
-  if (!s) { s = { samples: [], cursor: 0, lastError: '' }; wbChannelStats.set(id, s); }
+  if (!s) { s = { samples: [], cursor: 0, lastError: '', creditParks: {} }; wbChannelStats.set(id, s); }
   return s;
+}
+
+/* ── 积分耗尽短路 ────────────────────────────────────────
+   上游说「这个号在这个模型上没钱了」（如 intl 回 429 带 code 14018
+   "Credits exhausted"）。hub 只把它当成普通限流给几秒冷却，紧接着又派同一个号 ——
+   于是余额明明用完了，请求还是一路打过去，客户端反复撞同一堵墙。
+
+   这里自己把 (出口, 模型) 记住：记下之后的请求**直接短路**，不再空转上游，
+   回一句「积分已用完」。默认 10 分钟后重试一次：真买加量包能立刻恢复，
+   而误判的代价被限制在十分钟内。 */
+const WB_CREDIT_PARK_MS = 10 * 60 * 1000;
+// 与脱敏规则里的「积分耗尽」同源，避免两处判据漂移
+const WB_CREDITS_RE = /credits?\s+exhausted|insufficient\s+credit|14018|余额不足/i;
+
+function wbIsCreditsExhausted(status, body) {
+  return WB_CREDITS_RE.test(String(body || ''));
+}
+
+function wbParkCredits(ch, model, ms = WB_CREDIT_PARK_MS) {
+  if (!ch || !model) return 0;
+  const st = wbChannelStat(ch.id);
+  const until = Date.now() + ms;
+  st.creditParks[String(model)] = until;
+  log('warn', 'WorkBuddy 模型积分耗尽，本出口该模型跳过', {
+    channel: ch.name || '默认', model, minutes: Math.round(ms / 60000),
+  });
+  return until;
+}
+
+/** 该 (出口, 模型) 是否还在积分耗尽的跳过期内；返回剩余毫秒，0 = 没被跳过。 */
+function wbCreditParked(ch, model) {
+  if (!ch || !model) return 0;
+  const st = wbChannelStat(ch.id);
+  const until = st.creditParks[String(model)] || 0;
+  return until > Date.now() ? until - Date.now() : 0;
+}
+
+/** 清掉某个模型的积分跳过（面板「重置」时一并清）。 */
+function wbClearCreditParks(id, model) {
+  const st = wbChannelStats.get(id);
+  if (!st) return false;
+  if (model) delete st.creditParks[String(model)];
+  else st.creditParks = {};
+  return true;
 }
 
 /** 模型属于哪一版；'' = 两版都有（不做 realm 预筛） */
@@ -5286,6 +5330,13 @@ function wbChannelView(ch) {
     eligible: ch.enabled && !wbBreakerActive(ch),
     // 这个出口对应哪个端口（站点渠道就是照它配 base_url 的）
     port: (wbExits().find((e) => e.realm === ch.realm) || {}).port || null,
+    // 积分耗尽被跳过的模型（面板可见，避免「明明有渠道却一直 429」查不到原因）
+    creditParks: (() => {
+      const now = Date.now();
+      return Object.entries(st.creditParks || {})
+        .filter(([, until]) => until > now)
+        .map(([model, until]) => ({ model, minutes: Math.ceil((until - now) / 60000) }));
+    })(),
   };
 }
 
@@ -5352,6 +5403,102 @@ function wbCrossRealmError(text) {
     || t.includes('only available on the international') || t.includes('only available on the domestic');
 }
 
+/* ── 上游错误脱敏 ──────────────────────────────────────────
+   hub 的报错原文里带了两类不该进客户端的东西：
+     ① 内部诊断：8 位账号 UID + 每个账号的熔断/冷却剩余时间（pool_unavailable_detail
+        拼在「no usable account」后面），这是纯内部状态；
+     ② 上游应答原文：采购链接、内部错误码（如 14018 Credits exhausted）。
+   客户端只需要一句能行动的话；原文进服务端日志和 recent 环（那里是排查现场）。
+
+   顺带纠一个误导：上游明说「积分耗尽」时 hub 把它归成了「限流」（14018 不是它的
+   6004 限额码），客户端会拿到假的 "rate limit"。这里按真实原因回。 */
+const WB_ERROR_RULES = [
+  [/no usable account|all are disabled|no healthy account/i,
+    'WorkBuddy 账号池暂时没有可用账号（上游账号冷却中），请稍后重试'],
+  // 与积分耗尽短路共用同一个判据，避免「客户端看到的原因」和「出口跳过的原因」漂移
+  [WB_CREDITS_RE, 'WorkBuddy 账号积分已用完，该模型需要购买加量包才能继续使用'],
+  [/concurrent chat limit/i, 'WorkBuddy 上游并发已满，请稍后重试'],
+  [/frequency limit|rate limit/i, 'WorkBuddy 上游限流，请稍后重试'],
+  [/service info not found|11102/i, '该模型在当前出口不可用'],
+  [/只在国际版提供|只在国内版提供|only available on the (international|domestic)/i,
+    '该模型不在当前出口提供，请改用对应出口的渠道'],
+  [/content reject|content policy|content review/i, '请求内容被上游内容审核拒绝'],
+  [/session.*(not found|expired)|凭证已过期/i, 'WorkBuddy 账号登录态已过期'],
+  [/context length|prompt too long|too many tokens|maximum context/i,
+    '请求超出模型上下文上限，请减少历史消息或附件'],
+];
+
+/** 上游的非 2xx 错误体 → 一句可行动的话（无匹配时按状态给通用句）。 */
+function wbSanitizeError(status, rawBody) {
+  const body = String(rawBody || '');
+  let message = `WorkBuddy 上游错误（HTTP ${status}）`;
+  for (const [re, msg] of WB_ERROR_RULES) {
+    if (re.test(body)) { message = msg; break; }
+  }
+  return JSON.stringify({ error: { message, type: 'upstream_error', code: status } });
+}
+
+// 透传流（2xx / 不识别的响应体）里的可识别泄漏标记：命中才处理，没命中原样放行。
+const WB_LEAK_MARKERS = ['各账号：', 'account for realm', 'add or enable one at the dashboard'];
+
+/** 把透传文本里的账号池内部诊断抹掉；原文照旧进服务端的 recent 环。 */
+function wbScrubText(text) {
+  let t = String(text);
+  // 「；各账号：<uid> 熔断 剩余 43 min，…」整段是内部状态
+  t = t.replace(/；各账号：[^"\\]*/g, '');
+  t = t.replace(/\s*-\s*add or enable one at the dashboard \(?\/\)?/gi, '');
+  return t;
+}
+
+/** 逐块判断要不要洗：没含泄漏标记的块一字节都不动（正常流量零开销）。
+ *  局限：标记横跨两个 chunk 时会漏（一个块只看到前半截，`includes` 认不出来）。
+ *  SSE 路径用下面的事件级洗法补掉这个洞 —— 见 wbSseScrubber。 */
+function wbScrubChunk(chunk) {
+  let s;
+  try {
+    // 注意：undici 的 body 分块是 Uint8Array 而不是 Buffer，直接 toString('utf-8')
+    // 会被忽略参数、走成 Array.toString()（"100,97,116,..." 的字节表），标记
+    // 永远匹配不上 —— 必须先转成 Buffer 再解码。
+    s = (Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).toString('utf-8');
+  } catch { return chunk; }
+  if (!WB_LEAK_MARKERS.some((m) => s.includes(m))) return chunk;
+  return Buffer.from(wbScrubText(s), 'utf-8');
+}
+
+/** SSE 事件级洗法：把上游流攒成完整事件再判断，标记永远横跨不到两次 write。
+ *
+ *  为什么要按事件攒：SSE 的事件是 hub 一次 write 出去的完整单位，但 TCP 分块
+ *  可能把它劈开（实测整文件并发跑时就劈了）。逐块洗会漏，整块攒到 `\n\n`
+ *  再洗则不会 —— 而 `\n` 不会出现在任何多字节字符内部，所以切点一定在
+ *  UTF-8 边界上，不会洗坏字节。
+ *
+ *  延迟代价只有一个事件（正常 hub 一个事件一次 write，到得即时洗即发）。
+ *  write() 由调用方给出，这里把 drain 等待也交还给它。 */
+function wbSseScrubber(write) {
+  let pending = Buffer.alloc(0);
+  const lf = Buffer.from('\n\n', 'utf8');
+  const crlf = Buffer.from('\r\n\r\n', 'utf8');
+  return {
+    async push(chunk) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      pending = pending.length ? Buffer.concat([pending, buf]) : buf;
+      for (;;) {
+        const a = pending.indexOf(lf);
+        const b = pending.indexOf(crlf);
+        const at = (a < 0 || (b >= 0 && b < a)) ? b : a;
+        if (at < 0) return;
+        const cut = at + (at === b ? crlf.length : lf.length);
+        await write(wbScrubChunk(pending.subarray(0, cut)));
+        pending = pending.subarray(cut);
+      }
+    },
+    async end() {
+      if (pending.length) await write(wbScrubChunk(pending));
+      pending = Buffer.alloc(0);
+    },
+  };
+}
+
 /* ── WorkBuddy 对外出口 ────────────────────────────────────
    /wb/v1/* 原样转发到 hub 的 /v1/*，并把 hub 自己的 key 注进去（hub 只认自己的 key，
    调用方不必关心它）。
@@ -5406,8 +5553,22 @@ async function handleWorkbuddyEgress(req, res, url) {
 
   let lastError = '';
   let lastStatus = 0;
+  let creditParkedAll = 0;
   for (let i = 0; i < plan.length; i++) {
     const ch = plan[i];
+    // 积分耗尽的出口/模型：直接跳过，别再空转上游（上游自己不会记这事，
+    // 它只当成几秒的限流，紧接着又派同一个号）。
+    const parked = wbCreditParked(ch, model);
+    if (parked > 0) {
+      creditParkedAll = parked;
+      wbDiag('parked');
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
+        status: 429, ok: false, ttfb: 0,
+        err: `跳过：该出口该模型积分已用完（${Math.ceil(parked / 60000)} 分钟后重试）`,
+      });
+      continue;
+    }
     const target = `${(ch?.hubUrl || cfg.hubUrl)}${upstreamPath}${search}`;
     const headers = { ...baseHeaders };
     const apiKey = ch?.apiKey || cfg.hubApiKey;
@@ -5447,6 +5608,9 @@ async function handleWorkbuddyEgress(req, res, url) {
       // 了」，值得换一条；② 把原文记进最近请求环，排查时不用再猜。
       errorText = await upstream.text().catch(() => '');
       if (upstream.status === 400) retry = wbCrossRealmError(errorText);
+      // 积分耗尽：把 (出口, 模型) 记住，之后的请求直接短路不再打上游。
+      // hub 自己不记这事（14018 不是它的 6004 限额码，只给几秒限流冷却就继续派）。
+      if (wbIsCreditsExhausted(upstream.status, errorText)) wbParkCredits(ch, model);
     }
     if (retry && canRetry) {
       try { await upstream.body?.cancel(); } catch { /* 无所谓 */ }
@@ -5470,14 +5634,22 @@ async function handleWorkbuddyEgress(req, res, url) {
       const cc = upstream.headers.get('cache-control');
       if (cc) out['Cache-Control'] = cc;
       res.writeHead(upstream.status, out);
-      if (errorText !== null) { res.end(errorText); }
+      // 错误体不透传原文：上游/池子的内部诊断只进日志与 recent 环
+      if (errorText !== null) { res.end(wbSanitizeError(upstream.status, errorText)); }
       else if (!upstream.body) { res.end(); }
-      else {
-        let total = 0;
+      else if (String(upstream.headers.get('content-type') || '').toLowerCase().includes('text/event-stream')) {
+        // SSE：按事件攒齐再洗（标记跨块时逐块判断会漏），写不动就等 drain
+        const scrub = wbSseScrubber(async (buf) => {
+          if (!res.write(buf)) await new Promise((r) => res.once('drain', r));
+        });
+        for await (const chunk of upstream.body) await scrub.push(chunk);
+        await scrub.end();
+        res.end();
+      } else {
         for await (const chunk of upstream.body) {
           // 下游写不动就等它 drain，别把上游读爆
-          total += chunk.length;
-          if (!res.write(chunk)) await new Promise((r) => res.once('drain', r));
+          const clean = wbScrubChunk(chunk);
+          if (!res.write(clean)) await new Promise((r) => res.once('drain', r));
         }
         res.end();
       }
@@ -5514,6 +5686,17 @@ async function handleWorkbuddyEgress(req, res, url) {
     } finally {
       res.removeListener('close', onClose);
     }
+  }
+
+  // 所有渠道都被积分耗尽挡下（一次都没真发出去）：这不是「上游坏了」，
+  // 回 429 + 明确原因，别让客户端去猜也别让它一直重试。
+  if (!res.headersSent && creditParkedAll > 0 && !lastStatus && !lastError) {
+    return sendJSON(res, 429, {
+      error: {
+        message: `WorkBuddy 账号积分已用完，该模型需要购买加量包才能继续使用（约 ${Math.ceil(creditParkedAll / 60000)} 分钟后自动重试）`,
+        type: 'insufficient_quota',
+      },
+    });
   }
 
   if (!res.headersSent) {
@@ -5753,10 +5936,12 @@ async function handleAdminApi(req, res, url) {
   }
   if (wbEntry) {
     if (wbc[2] === '/reset' && req.method === 'POST') {
-      // 手动重置：熔断记录与采样窗口一起清，strikes 也归零
+      // 手动重置：熔断记录与采样窗口一起清，strikes 也归零；积分耗尽的跳过
+      // 一并清掉（想立刻重试就点它）
       wbEntry.breaker = null;
       wbChannelStat(wbEntry.id).samples = [];
       wbChannelStat(wbEntry.id).cursor = 0;
+      wbClearCreditParks(wbEntry.id);
       saveKeyStore();
       log('info', 'WorkBuddy 渠道熔断已手动重置', { channel: wbEntry.name });
       return sendJSON(res, 200, wbChannelView(wbEntry));
