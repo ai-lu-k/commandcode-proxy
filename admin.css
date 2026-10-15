@@ -1525,8 +1525,7 @@ input:disabled { opacity: 0.6; }
 .wb-bar-label { font-size: 12px; color: var(--muted); }
 .wb-bar-hint { margin-left: auto; font-size: 12px; color: var(--faint); }
 
-.wb-list { display: flex; flex-direction: column; }
-.wb-card {
+.wb-list { display: flex; flex-direction: column; }.wb-card {
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
   display: flex;
@@ -1554,6 +1553,41 @@ input:disabled { opacity: 0.6; }
   flex-wrap: wrap;
   justify-content: flex-end;
 }
+
+/* ── 账号池：默认折叠的卡片 ──────────────────────────────────
+   号一多时每张卡片都铺开「积分条 + 积分包 + 四项事实」会糊成一片。
+   头部保留状态点 / 名字 / 版本与健康 chip / 积分余量 / 开关 / 权重 ——
+   不展开也能扫，详情体只在点开时出现。 */
+.wb-acc { padding: 9px 16px; gap: 0; }
+.wb-acc .wb-card-head { cursor: pointer; row-gap: 6px; padding: 3px 0; }
+.wb-acc .wb-card-head:hover .wb-acc-caret { color: var(--ink); }
+/* 折叠态卡头一排放不下时仍保持单行语义：名字后面的状态 chip 允许换行 */
+.wb-acc .wb-card-tags { row-gap: 4px; }
+.wb-acc-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 8px;
+  margin-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.wb-acc-body[hidden] { display: none; }
+.wb-acc-caret {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--faint);
+  cursor: pointer;
+  transition: transform .15s ease, color .15s ease;
+}
+.wb-acc-caret .ic { width: 15px; height: 15px; }
+.wb-acc.is-open .wb-acc-caret { transform: rotate(180deg); color: var(--ink); }
+.wb-acc-caret:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .wb-meter { display: flex; flex-direction: column; gap: 5px; }
 .wb-meter-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--muted); }

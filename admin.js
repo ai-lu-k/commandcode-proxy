@@ -1682,6 +1682,10 @@
     return out.join('');
   }
 
+  // 折叠态按 uid 记，刷新/重渲染后保持；默认全部收起 —— 号一多时整屏卡片
+  // 铺开就看不清了，头部已经把「健康 + 积分 + 开关」都留在外面，收起也能扫。
+  const wbAccOpen = new Set();
+
   function wbAccountCard(a) {
     const uid = String(a.uid || '');
     const nick = a.nickname || a.email || uid.slice(0, 8) || '—';
@@ -1691,6 +1695,7 @@
     const pkgs = c && Array.isArray(c.packages) ? c.packages : [];
     const today = a.dailyTokensToday;
     const todayLimit = Number(a.dailyTokenLimit || 0);
+    const open = wbAccOpen.has(uid);
 
     const meter = c
       ? `<div class="wb-meter">
@@ -1703,7 +1708,13 @@
           </div>`
       : '<div class="wb-meter"><div class="wb-meter-sub">尚无额度快照（hub 每 12 小时刷新一次）</div></div>';
 
-    return `<article class="wb-card" data-uid="${escapeHtml(uid)}">
+    // 收起态也要一眼看到积分：卡片外面只留一个数，红的是真没钱了
+    const owe = c ? Number(c.remain) : null;
+    const remainChip = c
+      ? `<span class="wb-chip${owe <= 0 ? ' bad' : ''}" title="积分剩余 ${wbNum(c.remain)} / ${wbNum(c.size)}">剩 ${wbNum(owe)}</span>`
+      : '';
+
+    return `<article class="wb-card wb-acc${open ? ' is-open' : ''}" data-uid="${escapeHtml(uid)}">
         <header class="wb-card-head">
           <span class="wb-dot ${a.enabled === false ? 'off' : 'on'}" aria-hidden="true"></span>
           <div class="wb-card-title">
@@ -1712,6 +1723,7 @@
           </div>
           <div class="wb-card-tags">
             <span class="wb-chip">${escapeHtml(realm)}</span>
+            ${remainChip}
             ${a.platform ? `<span class="wb-chip">${escapeHtml(String(a.platform))}</span>` : ''}
             ${a.product ? `<span class="wb-chip">${escapeHtml(String(a.product))}</span>` : ''}
             ${wbStatusChips(a)}
@@ -1722,16 +1734,22 @@
               <span>启用</span>
             </label>
             <label class="wb-num">权重<input type="number" min="1" max="100" step="1" data-act="weight" value="${Number(a.weight || 1)}" /></label>
+            <button class="wb-acc-caret" type="button" data-act="expand"
+                    aria-expanded="${open}" aria-label="${open ? '收起详情' : '展开详情'}">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-chevron"/></svg>
+            </button>
           </div>
         </header>
-        ${meter}
-        ${c && c.earliest_expiring ? `<div class="wb-note">最早到期：${escapeHtml(wbExpiringLabel(c.earliest_expiring))}</div>` : ''}
-        ${pkgs.length ? `<div class="wb-pkgs">${pkgs.map(wbPkgRow).join('')}</div>` : ''}
-        <div class="wb-facts">
-          <div class="wb-fact"><span>订阅到期</span><b>${escapeHtml(wbExpiry(a))}</b></div>
-          <div class="wb-fact"><span>积分包</span><b>${pkgs.length} 个</b></div>
-          <div class="wb-fact"><span>今日 Token</span><b>${today == null ? '—' : wbNum(today, 0)}${todayLimit ? ' / ' + wbNum(todayLimit, 0) : ''}</b></div>
-          <div class="wb-fact"><span>额度快照</span><b>${escapeHtml(String((c && c.updated_iso) || '—').slice(11) || '—')}</b></div>
+        <div class="wb-acc-body"${open ? '' : ' hidden'}>
+          ${meter}
+          ${c && c.earliest_expiring ? `<div class="wb-note">最早到期：${escapeHtml(wbExpiringLabel(c.earliest_expiring))}</div>` : ''}
+          ${pkgs.length ? `<div class="wb-pkgs">${pkgs.map(wbPkgRow).join('')}</div>` : ''}
+          <div class="wb-facts">
+            <div class="wb-fact"><span>订阅到期</span><b>${escapeHtml(wbExpiry(a))}</b></div>
+            <div class="wb-fact"><span>积分包</span><b>${pkgs.length} 个</b></div>
+            <div class="wb-fact"><span>今日 Token</span><b>${today == null ? '—' : wbNum(today, 0)}${todayLimit ? ' / ' + wbNum(todayLimit, 0) : ''}</b></div>
+            <div class="wb-fact"><span>额度快照</span><b>${escapeHtml(String((c && c.updated_iso) || '—').slice(11) || '—')}</b></div>
+          </div>
         </div>
       </article>`;
   }
@@ -1744,10 +1762,13 @@
     if (!rows.length) {
       wrap.innerHTML = '';
       if (empty) empty.classList.remove('hidden');
+      wbAccSyncToggleAll();
       return;
     }
     if (empty) empty.classList.add('hidden');
+    // 折叠态存在 wbAccOpen 里，重渲染不会丢
     wrap.innerHTML = rows.map(wbAccountCard).join('');
+    wbAccSyncToggleAll();
   }
 
   function renderWbKpis() {
@@ -2305,7 +2326,58 @@
         if (Number.isFinite(w) && w >= 1 && w <= 100) wbAccSet(uid, { weight: w }, `${nick} 权重已设为 ${w}`);
       }
     });
+
+    // 展开/收起：点头部或右侧箭头都行（开关、权重控件本身不参与，它们有各自的语义）
+    const wbAccToggle = (card) => {
+      const uid = card?.dataset.uid;
+      if (!uid) return;
+      const nowOpen = !wbAccOpen.has(uid);
+      if (nowOpen) wbAccOpen.add(uid); else wbAccOpen.delete(uid);
+      card.classList.toggle('is-open', nowOpen);
+      const body = card.querySelector('.wb-acc-body');
+      if (body) body.hidden = !nowOpen;
+      const btn = card.querySelector('[data-act="expand"]');
+      if (btn) {
+        btn.setAttribute('aria-expanded', String(nowOpen));
+        btn.setAttribute('aria-label', nowOpen ? '收起详情' : '展开详情');
+      }
+      wbAccSyncToggleAll();
+    };
+    wbAccListEl.addEventListener('click', (e) => {
+      const card = e.target.closest('.wb-acc');
+      if (!card) return;
+      // 点在开关/权重上不算「想展开」——那两个是控件
+      if (e.target.closest('.wb-switch, .wb-num')) return;
+      wbAccToggle(card);
+    });
   }
+
+  /** 「全部展开/全部收起」按钮的文案随当前状态走 */
+  function wbAccSyncToggleAll() {
+    const btn = $('#wbAccExpandAll');
+    if (!btn) return;
+    const rows = state.wb?.accounts || [];
+    const allOpen = rows.length > 0 && rows.every((a) => wbAccOpen.has(String(a.uid || '')));
+    btn.querySelector('.btn-label').textContent = allOpen ? '全部收起' : '全部展开';
+  }
+
+  $('#wbAccExpandAll')?.addEventListener('click', () => {
+    const rows = state.wb?.accounts || [];
+    const allOpen = rows.length > 0 && rows.every((a) => wbAccOpen.has(String(a.uid || '')));
+    const list = $('#wbAccountList');
+    rows.forEach((a) => {
+      const uid = String(a.uid || '');
+      if (allOpen) wbAccOpen.delete(uid); else wbAccOpen.add(uid);
+      const card = list?.querySelector(`.wb-acc[data-uid="${CSS.escape(uid)}"]`);
+      if (!card) return;
+      card.classList.toggle('is-open', !allOpen);
+      const body = card.querySelector('.wb-acc-body');
+      if (body) body.hidden = allOpen;
+      const b = card.querySelector('[data-act="expand"]');
+      if (b) b.setAttribute('aria-expanded', String(!allOpen));
+    });
+    wbAccSyncToggleAll();
+  });
   $('#wbSchedRefresh').addEventListener('click', () => refreshWbSchedule());
   $('#wbSchedTrigger').addEventListener('click', async () => {
     const btn = $('#wbSchedTrigger');

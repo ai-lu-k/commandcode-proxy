@@ -46,6 +46,8 @@ test('渠道池用到的 CSS 类都有样式', () => {
   const need = [
     '.wb-channels', '.wb-ch', '.wb-ch-acts', '.wb-switch', '.wb-num',
     '.wb-dot.trip', '.wb-chip.trip', '.wb-chip.off', '.wb-fact.bad', '.side-count-alert',
+    // 账号池的折叠卡片（默认收起，点头部展开）
+    '.wb-acc', '.wb-acc-body', '.wb-acc-caret', '.wb-acc.is-open',
   ];
   // 只要求「这个类名作为独立 token 出现过」，后面的组合选择器（.wb-fact.bad b）
   // 也算数，但不能被更长的类名（.wb-ch-acts 之于 .wb-ch）冒充
