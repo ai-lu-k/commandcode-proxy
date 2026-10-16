@@ -5339,6 +5339,11 @@ function wbChannelView(ch) {
         .filter(([, until]) => until > now)
         .map(([model, until]) => ({ model, minutes: Math.ceil((until - now) / 60000) }));
     })(),
+    // 整池没号被短期短路的出口（面板可见，免得「明明配了渠道却本地就 503」查不到原因）
+    drainSec: (() => {
+      const left = wbDrainRemaining(ch.realm);
+      return left > 0 ? Math.ceil(left / 1000) : 0;
+    })(),
   };
 }
 
@@ -5516,6 +5521,122 @@ function wbSseScrubber(write) {
   };
 }
 
+/* ── 价格档位名回落 ────────────────────────────────────────
+   站点把「同一个模型的不同价位」拼进模型名（deepseek-v4.1-flash-x0.01），
+   再靠渠道的 model_mapping 翻成上游认的基础名。任何绕过站点直接打出口的调用
+   都带着档位名上来，上游只回 11102「模型不存在」，调用方看到的却是「暂时不可用」
+   —— 既说不清原因，又会被算成渠道故障。
+
+   这里照上游目录兜一层：名字不在目录里、去掉尾部 -x<倍率> 后在里面，就按基础名
+   转发。**只在目录里确实有基础名时才动**，所以不可能把请求改到一个上游不认识的
+   模型上；目录拉不到就一律不动，绝不因为兜底把请求挡下来。 */
+const WB_CATALOG_TTL_MS = 10 * 60 * 1000;
+const wbCatalogs = new Map();   // baseUrl -> { at, ids, inflight }
+
+function wbCatalogFor(baseUrl) {
+  let e = wbCatalogs.get(baseUrl);
+  if (!e) { e = { at: 0, ids: null, inflight: null }; wbCatalogs.set(baseUrl, e); }
+  return e;
+}
+
+async function wbCatalogIds(baseUrl, apiKey) {
+  const e = wbCatalogFor(baseUrl);
+  if (e.ids && Date.now() - e.at < WB_CATALOG_TTL_MS) return e.ids;
+  if (e.inflight) return e.inflight;
+  e.inflight = (async () => {
+    try {
+      const r = await wbFetchRaw(`${baseUrl}/v1/models`, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        // 只有第一次要等；回来就缓存 10 分钟，之后是纯内存查表
+        timeoutMs: 2500,
+      });
+      const list = Array.isArray(r.data?.data) ? r.data.data : null;
+      if (!list) return e.ids;
+      e.ids = new Set(list.map((m) => String(m?.id || '')).filter(Boolean));
+      e.at = Date.now();
+      return e.ids;
+    } catch {
+      return e.ids;
+    } finally {
+      e.inflight = null;
+    }
+  })();
+  return e.inflight;
+}
+
+/** 档位名的候选基础名：先「去掉 -x 倍率、保留 @修饰」，再「连修饰一起去掉」 */
+function wbTierCandidates(model) {
+  const s = String(model || '');
+  if (!s) return [];
+  const at = s.indexOf('@');
+  const head = at > 0 ? s.slice(0, at) : s;
+  const tail = at > 0 ? s.slice(at) : '';
+  const m = /^(.+)-x(\d{1,4}(?:\.\d{1,6})?)$/.exec(head);
+  if (!m) return [];
+  return tail ? [m[1] + tail, m[1]] : [m[1]];
+}
+
+async function wbResolveModel(model, baseUrl, apiKey) {
+  if (!model) return { model, changed: false };
+  // 只有「看起来像档位名」的名字才去查目录：绝大多数请求的名字跟目录一致，
+  // 不该为了它们多打一次 /v1/models。
+  const cands = wbTierCandidates(model);
+  if (!cands.length) return { model, changed: false };
+  const ids = await wbCatalogIds(baseUrl, apiKey);
+  if (!ids || !ids.size || ids.has(model)) return { model, changed: false };
+  for (const cand of cands) {
+    if (ids.has(cand)) {
+      log('info', 'WorkBuddy 价格档位名按基础模型名转发', { from: model, to: cand });
+      return { model: cand, changed: true };
+    }
+  }
+  return { model, changed: false };
+}
+
+/** 把 body 里的 model 换成上游认的名字；不是 JSON、或本来就没变，就原样返回 */
+function wbWithModel(body, model) {
+  if (!body || !body.length) return body;
+  try {
+    const j = JSON.parse(body.toString('utf-8'));
+    if (!j || typeof j !== 'object' || j.model === model) return body;
+    j.model = model;
+    return Buffer.from(JSON.stringify(j), 'utf-8');
+  } catch {
+    return body;
+  }
+}
+
+/* ── 整池没号的短期短路 ────────────────────────────────────
+   hub 回「no usable account for realm 'x'」之前要先把账号池扫一遍（实测 0.3s 上下）。
+   出口整池没号时，站点分到这个端口的那一半请求全都要白等这一下才换渠道：既慢，
+   又在 hub 的用量里堆出一大把没法归属的失败。这里记下「这个出口刚刚没号」，
+   短期内在本地直接 503，站点立刻换另一条渠道。窗口很短，任何一次成功都立刻解除。 */
+const WB_DRAIN_MS = 12000;
+const wbDrains = new Map();    // realm -> until
+
+function wbDrainRemaining(realm) {
+  if (!realm) return 0;
+  const until = wbDrains.get(realm) || 0;
+  if (!until) return 0;
+  const left = until - Date.now();
+  if (left <= 0) { wbDrains.delete(realm); return 0; }
+  return left;
+}
+
+function wbNoteDrain(realm, errorText) {
+  if (!realm) return false;
+  if (!/no usable account for realm/i.test(String(errorText || ''))) return false;
+  wbDrains.set(realm, Date.now() + WB_DRAIN_MS);
+  return true;
+}
+
+function wbClearDrains(realm) {
+  if (realm) return wbDrains.delete(realm);
+  const had = wbDrains.size > 0;
+  wbDrains.clear();
+  return had;
+}
+
 /* ── WorkBuddy 对外出口 ────────────────────────────────────
    /wb/v1/* 原样转发到 hub 的 /v1/*，并把 hub 自己的 key 注进去（hub 只认自己的 key，
    调用方不必关心它）。
@@ -5546,11 +5667,20 @@ async function handleWorkbuddyEgress(req, res, url) {
   }
 
   const channels = keyStore.wbChannels || [];
-  const model = wbModelOfBody(body);
+  let model = wbModelOfBody(body);
   wbDiag('model', { lastModel: model });
   // 端口决定出口版本；这个版本配过渠道（不论是否启用）就说明操作者接管过它。
   const exitRealm = wbRealmForPort(localPort);
   const configured = channels.filter((c) => !exitRealm || c.realm === exitRealm);
+  // 站点风格的价格档位名（<模型>-x<倍率>）：上游目录不认这个名字时按基础名转发
+  const scoped = configured[0] || channels[0] || null;
+  const resolved = await wbResolveModel(
+    model, scoped?.hubUrl || cfg.hubUrl, scoped?.apiKey || cfg.hubApiKey,
+  );
+  if (resolved.changed) {
+    body = wbWithModel(body, resolved.model);
+    model = resolved.model;
+  }
   let plan = channels.length ? wbPlan(model, exitRealm) : [null];
   if (!plan.length) {
     if (configured.length) {
@@ -5572,8 +5702,21 @@ async function handleWorkbuddyEgress(req, res, url) {
   let lastError = '';
   let lastStatus = 0;
   let creditParkedAll = 0;
+  let drainSkipped = 0;
   for (let i = 0; i < plan.length; i++) {
     const ch = plan[i];
+    // 这个出口刚刚整池没号：本地短路，别让每个请求都白等 hub 扫一遍账号池
+    const draining = wbDrainRemaining(ch?.realm || exitRealm);
+    if (draining > 0) {
+      drainSkipped = Math.max(drainSkipped, draining);
+      wbDiag('draining');
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
+        status: 503, ok: false, ttfb: 0,
+        err: `跳过：该出口刚回报整池没号（${Math.ceil(draining / 1000)}s 后重试）`,
+      });
+      continue;
+    }
     // 积分耗尽的出口/模型：直接跳过，别再空转上游（上游自己不会记这事，
     // 它只当成几秒的限流，紧接着又派同一个号）。
     const parked = wbCreditParked(ch, model);
@@ -5629,6 +5772,17 @@ async function handleWorkbuddyEgress(req, res, url) {
       // 积分耗尽：把 (出口, 模型) 记住，之后的请求直接短路不再打上游。
       // hub 自己不记这事（14018 不是它的 6004 限额码，只给几秒限流冷却就继续派）。
       if (wbIsCreditsExhausted(upstream.status, errorText)) wbParkCredits(ch, model);
+      // 整池没号：记下这个出口，短期内在本地短路（省掉每个请求白等 hub 扫池的
+      // 那一下，也让 hub 少记一堆归属不了的失败）。
+      if (wbNoteDrain(ch?.realm || exitRealm, errorText)) {
+        wbDiag('drain');
+        log('warn', 'WorkBuddy 出口整池没号，短期内本地短路', {
+          realm: ch?.realm || exitRealm, seconds: Math.round(WB_DRAIN_MS / 1000),
+        });
+      }
+    } else {
+      // 这个出口确实有号，解除短路
+      wbClearDrains(ch?.realm || exitRealm);
     }
     if (retry && canRetry) {
       try { await upstream.body?.cancel(); } catch { /* 无所谓 */ }
@@ -5671,7 +5825,10 @@ async function handleWorkbuddyEgress(req, res, url) {
         }
         res.end();
       }
-      if (ch) {
+      // 调用方自己的错（模型名不存在、参数被拒、body 太大）不该算渠道故障：否则
+      // 一个打错模型名的客户端就能把整条出口熔断掉。429 是渠道/限额的事，照记。
+      const clientShaped = upstream.status >= 400 && upstream.status < 500 && upstream.status !== 429;
+      if (ch && !clientShaped) {
         const ok = upstream.status < 400;
         if (wbRecordSample(ch, {
           at: Date.now(), ttfb, totalMs: Date.now() - t0, ok, status: upstream.status,
@@ -5706,15 +5863,17 @@ async function handleWorkbuddyEgress(req, res, url) {
     }
   }
 
-  // 所有渠道都被积分耗尽挡下（一次都没真发出去）：对外还是通用话术，
-  // 原因（哪个模型、还剩几分钟）只在服务端的日志与 recent 环里。
-  if (!res.headersSent && creditParkedAll > 0 && !lastStatus && !lastError) {
-    log('warn', 'WorkBuddy 全部出口都因积分耗尽被跳过', {
-      model, minutes: Math.ceil(creditParkedAll / 60000),
+  // 所有渠道都被挡下（积分耗尽 / 出口刚回报整池没号），一次都没真发出去：对外还是
+  // 通用话术，原因（哪个模型、还剩多久）只在服务端的日志与 recent 环里。
+  if (!res.headersSent && (creditParkedAll > 0 || drainSkipped > 0) && !lastStatus && !lastError) {
+    log('warn', 'WorkBuddy 全部出口都被跳过', {
+      model,
+      creditParkedMinutes: creditParkedAll ? Math.ceil(creditParkedAll / 60000) : 0,
+      drainSeconds: drainSkipped ? Math.ceil(drainSkipped / 1000) : 0,
     });
     return sendJSON(res, 503, {
       error: { message: WB_UNAVAILABLE, type: 'server_error' },
-      retry_after: Math.max(1, Math.ceil(creditParkedAll / 1000)),
+      retry_after: Math.max(1, Math.ceil((creditParkedAll || drainSkipped) / 1000)),
     });
   }
 
@@ -5954,12 +6113,13 @@ async function handleAdminApi(req, res, url) {
   }
   if (wbEntry) {
     if (wbc[2] === '/reset' && req.method === 'POST') {
-      // 手动重置：熔断记录与采样窗口一起清，strikes 也归零；积分耗尽的跳过
-      // 一并清掉（想立刻重试就点它）
+      // 手动重置：熔断记录与采样窗口一起清，strikes 也归零；积分耗尽的跳过与
+      // 「整池没号」的短期短路一并清掉（想立刻重试就点它）
       wbEntry.breaker = null;
       wbChannelStat(wbEntry.id).samples = [];
       wbChannelStat(wbEntry.id).cursor = 0;
       wbClearCreditParks(wbEntry.id);
+      wbClearDrains(wbEntry.realm);
       saveKeyStore();
       log('info', 'WorkBuddy 渠道熔断已手动重置', { channel: wbEntry.name });
       return sendJSON(res, 200, wbChannelView(wbEntry));
