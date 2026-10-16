@@ -183,3 +183,55 @@ test('调用方自己的 400 不该把出口熔断', async (t) => {
   assert.equal(v.channels[0].breakerActive, false, '调用方打错模型名不该熔断出口');
   assert.equal(v.channels[0].stats.errorCount, 0, '这种 400 不该算进错误样本');
 });
+
+test('上游把「这个账号/渠道不可用」报成 400 时，对外必须是 5xx', async (t) => {
+  // 线上实测：国际版出口的账号状态坏掉时，上游回 400 + code 11128
+  // （conversation id missing / Illegal API invocation）。请求本身没问题，
+  // 但 400 站点不会换渠道，直接甩给用户 —— 于是用户「一直报错」。
+  let chatCalls = 0;
+  const hub = await startMockUpstream({
+    onRequest: (req, res, seen) => {
+      if (req.url.startsWith('/v1/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(CATALOG));
+        return;
+      }
+      chatCalls++;
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: '{"code":11128,"msg":"conversation id missing"}' } }));
+    },
+  });
+  const workdir = mkdtempSync(join(tmpdir(), 'ccp-wb11128-'));
+  writeKeys(workdir, { id: 'c-11128', name: '渠道级 400 出口', port: hub.port }, {
+    wbBreaker: { slowMs: 60000, window: 4, slowCount: 4, errorCount: 2, openMs: 60000, maxOpenMs: 300000 },
+  });
+  const proxy = await startProxy({ upstreamPort: hub.port, cwd: workdir, env: { WB_EXIT2_PORT: '0' } });
+  t.after(async () => {
+    await proxy.kill();
+    await hub.close();
+    try { rmSync(workdir, { recursive: true, force: true }); } catch {}
+  });
+
+  await t.test('客户端看到的是 503 + 通用话术（不是 400）', async () => {
+    const r = await proxy.post('/wb/v1/chat/completions', CHAT);
+    assert.equal(r.status, 503, '必须是 5xx，站点才会换渠道');
+    const wire = JSON.stringify(await r.json());
+    assert.ok(!LEAKY.test(wire), `不得出现后端字样：${wire}`);
+    assert.match(wire, /暂时不可用/);
+  });
+
+  await t.test('再打一次就够熔断（算渠道错误，不算调用方的错）', async () => {
+    await proxy.post('/wb/v1/chat/completions', CHAT);
+    const v = await (await proxy.get('/admin/api/wb/channels')).json();
+    assert.equal(v.channels[0].stats.errorCount, 2, '两次都要算进错误样本');
+    assert.equal(v.channels[0].breakerActive, true, '两次就该熔断');
+  });
+
+  await t.test('recent 环里同时留下「站点看到的 503」和「上游原始 400」', async () => {
+    const v = await (await proxy.get('/admin/api/wb/channels')).json();
+    const last = v.recent[v.recent.length - 1];
+    assert.equal(last.status, 503);
+    assert.match(String(last.err), /上游 400/, `环里要看得到上游原始状态：${last.err}`);
+    assert.equal(chatCalls, 2);
+  });
+});

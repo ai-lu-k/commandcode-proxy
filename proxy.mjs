@@ -5410,6 +5410,18 @@ function wbCrossRealmError(text) {
     || t.includes('only available on the international') || t.includes('only available on the domestic');
 }
 
+/** 上游把「这个账号/渠道不可用」也报成 400：11128 是它的拦截码
+ *  （原文 Illegal API invocation from an unapproved channel / conversation id missing）。
+ *  请求本身没问题，换个账号就好 —— 这类必须当渠道故障处理：
+ *  ① 换下一条渠道；② 对外给 5xx，站点才会换渠道而不是把 400 直接甩给用户；
+ *  ③ 计进错误率，让熔断真的能把它摘下去。 */
+const WB_CHANNEL_LEVEL_RE = /11128|illegal\s+api\s+invocation|conversation\s+id\s+missing/i;
+
+function wbIsChannelLevelError(status, errorText) {
+  return Number(status) >= 400 && Number(status) < 500
+    && WB_CHANNEL_LEVEL_RE.test(String(errorText || ''));
+}
+
 /* ── 上游错误脱敏 ──────────────────────────────────────────
    对外只给一句通用话术。调用方不需要知道中转站后面是账号池、是哪一版出口、余额够不够、
    上游是不是在限流 —— 线上被连着指出两轮：先是账号 UID，后是「账号池 / 上游账号冷却」
@@ -5764,11 +5776,16 @@ async function handleWorkbuddyEgress(req, res, url) {
     // 渠道，429/5xx 在客户端看来就是「这个模型坏了」。
     let retry = WB_RETRY_STATUS.has(upstream.status);
     let errorText = null;
+    let channelLevel = false;
     if (upstream.status >= 400) {
       // 读错误体有两个用处：① 跨出口的 400 只有读到 body 才知道它其实是「走错版本
       // 了」，值得换一条；② 把原文记进最近请求环，排查时不用再猜。
       errorText = await upstream.text().catch(() => '');
       if (upstream.status === 400) retry = wbCrossRealmError(errorText);
+      // 上游把「这个账号/渠道不可用」也报成 400（11128）：请求没问题，换渠道就好。
+      // 得换下一条渠道，而且对外必须是 5xx —— 4xx 站点不会换渠道，直接甩给用户。
+      channelLevel = wbIsChannelLevelError(upstream.status, errorText);
+      if (channelLevel) retry = true;
       // 积分耗尽：把 (出口, 模型) 记住，之后的请求直接短路不再打上游。
       // hub 自己不记这事（14018 不是它的 6004 限额码，只给几秒限流冷却就继续派）。
       if (wbIsCreditsExhausted(upstream.status, errorText)) wbParkCredits(ch, model);
@@ -5805,9 +5822,12 @@ async function handleWorkbuddyEgress(req, res, url) {
       const out = { 'Content-Type': upstream.headers.get('content-type') || 'application/json' };
       const cc = upstream.headers.get('cache-control');
       if (cc) out['Cache-Control'] = cc;
-      res.writeHead(upstream.status, out);
+      // 渠道级的 4xx 对外报 5xx：4xx 站点不会换渠道，会把错误直接甩给用户；
+      // 5xx 它才换下一条渠道。上游实际状态码原样留在 recent 环里。
+      const clientStatus = channelLevel ? 503 : upstream.status;
+      res.writeHead(clientStatus, out);
       // 错误体不透传原文：上游/池子的内部诊断只进日志与 recent 环
-      if (errorText !== null) { res.end(wbSanitizeError(upstream.status, errorText)); }
+      if (errorText !== null) { res.end(wbSanitizeError(clientStatus, errorText)); }
       else if (!upstream.body) { res.end(); }
       else if (String(upstream.headers.get('content-type') || '').toLowerCase().includes('text/event-stream')) {
         // SSE：按事件攒齐再洗（标记跨块时逐块判断会漏），写不动就等 drain
@@ -5826,8 +5846,10 @@ async function handleWorkbuddyEgress(req, res, url) {
         res.end();
       }
       // 调用方自己的错（模型名不存在、参数被拒、body 太大）不该算渠道故障：否则
-      // 一个打错模型名的客户端就能把整条出口熔断掉。429 是渠道/限额的事，照记。
-      const clientShaped = upstream.status >= 400 && upstream.status < 500 && upstream.status !== 429;
+      // 一个打错模型名的客户端就能把整条出口熔断掉。429 与渠道级的 4xx（11128）
+      // 是渠道/限额的事，照记。
+      const clientShaped = upstream.status >= 400 && upstream.status < 500
+        && upstream.status !== 429 && !channelLevel;
       if (ch && !clientShaped) {
         const ok = upstream.status < 400;
         if (wbRecordSample(ch, {
@@ -5837,8 +5859,9 @@ async function handleWorkbuddyEgress(req, res, url) {
       wbDiag('record');
       wbNoteRecent({
         path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
-        status: upstream.status, ok: upstream.status < 400, ttfb, totalMs: Date.now() - t0,
-        err: upstream.status < 400 ? '' : String(errorText || '').slice(0, 200),
+        status: clientStatus, ok: upstream.status < 400, ttfb, totalMs: Date.now() - t0,
+        err: upstream.status < 400 ? ''
+          : `${upstream.status !== clientStatus ? `上游 ${upstream.status} → ` : ''}${String(errorText || '').slice(0, 200)}`,
       });
       return;
     } catch (e) {
