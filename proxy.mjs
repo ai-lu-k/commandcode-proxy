@@ -62,6 +62,12 @@ const WB_DEFAULTS = {
   exit1Realm: 'intl',
   exit2Port: 3051,
   exit2Realm: 'cn',
+  // ── 出错前先扛一会儿 ─────────────────────────────
+  // 两个诉求：① 本出口整个没容量时，自动去另一个版本试（站点通常只有一条渠道，
+  // 不一定换得过去）；② 两边都没容量（都在冷却/整池没号）时别立刻报错，等一会重来，
+  // 让账号池自己恢复。宁可让调用方多等几秒，也尽量别把 503 直接丢给用户。
+  crossRealmFallback: true,  // 本出口没容量时，用另一个版本的渠道兜底
+  waitBudgetMs: 6000,        // 两边都没容量时最多等多久再重试（0 = 不等待）
 };
 
 function loadConfig() {
@@ -134,6 +140,13 @@ function loadConfig() {
   if (process.env.WB_EXIT1_REALM !== undefined) defaults.workbuddy.exit1Realm = process.env.WB_EXIT1_REALM;
   if (process.env.WB_EXIT2_PORT !== undefined) defaults.workbuddy.exit2Port = parseInt(process.env.WB_EXIT2_PORT, 10) || 0;
   if (process.env.WB_EXIT2_REALM !== undefined) defaults.workbuddy.exit2Realm = process.env.WB_EXIT2_REALM;
+  if (process.env.WB_CROSS_REALM_FALLBACK !== undefined) {
+    defaults.workbuddy.crossRealmFallback = process.env.WB_CROSS_REALM_FALLBACK !== '0';
+  }
+  if (process.env.WB_WAIT_BUDGET_MS !== undefined) {
+    const ms = parseInt(process.env.WB_WAIT_BUDGET_MS, 10);
+    if (Number.isFinite(ms) && ms >= 0) defaults.workbuddy.waitBudgetMs = ms;
+  }
   if (process.env.WB_DISABLED === '1') defaults.workbuddy.enabled = false;
 
   return defaults;
@@ -5649,6 +5662,21 @@ function wbClearDrains(realm) {
   return had;
 }
 
+/** 可中断的等待：客户端提前挂断就立刻返回，不用把定时器等满。
+ *  等待只用于「池子整个没容量」这种会自己恢复的情况（冷却到点、积分刷新、
+ *  账号重新登录），别把调用方卡死在一个永远不会好的出口上。 */
+function wbWait(ms, res) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(finish, ms);
+    function finish() {
+      clearTimeout(timer);
+      if (res) res.removeListener('close', finish);
+      resolve();
+    }
+    if (res) res.once('close', finish);
+  });
+}
+
 /* ── WorkBuddy 对外出口 ────────────────────────────────────
    /wb/v1/* 原样转发到 hub 的 /v1/*，并把 hub 自己的 key 注进去（hub 只认自己的 key，
    调用方不必关心它）。
@@ -5709,16 +5737,43 @@ async function handleWorkbuddyEgress(req, res, url) {
     // 这个版本压根没配过渠道（全新部署）：退回隐式渠道，靠 X-Realm 说话
     plan = [null];
   }
+  // 跨版本兜底：本出口整个没容量（整池没号 / 全被停用 / 全在冷却）时，去另一个
+  // 版本试。站点通常只给 WorkBuddy 开一条渠道，它自己不一定换得过去；宁可换个版本
+  // 的账号把结果拿出来，也别把错误直接丢给用户。两条硬约束：
+  //   ① 手动停用的渠道绝对不兜底 —— 上面 noPlan 那条已经提前返回，那是操作者的意图；
+  //   ② 只在一版提供的模型（wbModelRealm 认得出）也不兜底，那边根本没有这个模型。
+  const attempts = plan.slice();
+  const crossRealm = [];
+  if (WB().crossRealmFallback !== false && plan.length && plan.every(Boolean) && !wbModelRealm(model)) {
+    for (const c of channels) {
+      if (c.enabled && c.realm && c.realm !== exitRealm && !attempts.includes(c)) crossRealm.push(c);
+    }
+    attempts.push(...crossRealm);
+  }
+  if (crossRealm.length) wbDiag('crossRealm');
   wbDiag('forward');
 
   let lastError = '';
   let lastStatus = 0;
   let creditParkedAll = 0;
   let drainSkipped = 0;
-  for (let i = 0; i < plan.length; i++) {
-    const ch = plan[i];
-    // 这个出口刚刚整池没号：本地短路，别让每个请求都白等 hub 扫一遍账号池
-    const draining = wbDrainRemaining(ch?.realm || exitRealm);
+  // 本轮的失败里有没有「池子整个没容量」：这一类会自己恢复（冷却到点、积分刷新、
+  // 账号重新登录），才值得等一会儿重来。
+  let poolEmpty = false;
+  // 等一会儿再试的预算：只有「两个版本都没容量」才用得上，而且只等池子能自己恢复
+  // 的那类失败（整池没号）。别的失败要么换渠道立刻解决，要么重试也没用。
+  const waitBudgetMs = Number.isFinite(Number(WB().waitBudgetMs)) && Number(WB().waitBudgetMs) >= 0
+    ? Number(WB().waitBudgetMs) : 6000;
+  const waitDeadline = Date.now() + waitBudgetMs;
+  let roundDelayMs = 600;
+  let round = 0;
+  for (;; round++) {
+  for (let i = 0; i < attempts.length; i++) {
+    const ch = attempts[i];
+    // 这个出口刚刚整池没号：第一轮本地短路（省掉白等 hub 扫池的那一下，好尽快试
+    // 另一版本），但**重试轮不再短路** —— 等待的意义就是再真打一次看看池子恢复没有
+    // （冷却到点、积分刷新、账号重新登录都会在这几秒里发生）。
+    const draining = round === 0 ? wbDrainRemaining(ch?.realm || exitRealm) : 0;
     if (draining > 0) {
       drainSkipped = Math.max(drainSkipped, draining);
       wbDiag('draining');
@@ -5770,7 +5825,7 @@ async function handleWorkbuddyEgress(req, res, url) {
       continue;
     }
     const ttfb = Date.now() - t0;
-    const canRetry = i < plan.length - 1;
+    const canRetry = i < attempts.length - 1;
 
     // 失败先用下一条渠道顶，而不是把错误原样丢给客户端：站点只有一条 WorkBuddy
     // 渠道，429/5xx 在客户端看来就是「这个模型坏了」。
@@ -5793,6 +5848,7 @@ async function handleWorkbuddyEgress(req, res, url) {
       // 那一下，也让 hub 少记一堆归属不了的失败）。
       if (wbNoteDrain(ch?.realm || exitRealm, errorText)) {
         wbDiag('drain');
+        poolEmpty = true;
         log('warn', 'WorkBuddy 出口整池没号，短期内本地短路', {
           realm: ch?.realm || exitRealm, seconds: Math.round(WB_DRAIN_MS / 1000),
         });
@@ -5813,7 +5869,21 @@ async function handleWorkbuddyEgress(req, res, url) {
       });
       lastStatus = upstream.status;
       log('warn', 'WorkBuddy 渠道失败，换下一条', {
-        channel: ch?.name || '默认', status: upstream.status, next: plan[i + 1]?.name || '默认',
+        channel: ch?.name || '默认', status: upstream.status, next: attempts[i + 1]?.name || '默认',
+      });
+      continue;
+    }
+
+    // 池子整个没容量 + 还有等待预算：先别把错误写出去，交给外层等一会儿再试。
+    // 这是「宁可多等几秒，也别直接报 503」的关键一步 —— 否则最后一个候选一失败就
+    // 把响应写死了，外层再想等也没有机会。
+    if (poolEmpty && !res.headersSent && Date.now() < waitDeadline) {
+      try { await upstream.body?.cancel(); } catch { /* 无所谓 */ }
+      res.removeListener('close', onClose);
+      wbNoteRecent({
+        path: url.pathname, model, channel: ch?.name || '默认', port: localPort,
+        status: upstream.status, ok: false, ttfb,
+        err: '没容量，等一会儿再试：' + String(errorText || '').slice(0, 120),
       });
       continue;
     }
@@ -5885,18 +5955,36 @@ async function handleWorkbuddyEgress(req, res, url) {
       res.removeListener('close', onClose);
     }
   }
+  // 这一轮（本版本 + 另一版本）都没成。只有「整池没号」这种会自己恢复的情况值得
+  // 再等一会儿重来：冷却到点、积分刷新、账号重新登录，都在几秒到几分钟内发生。
+  // 别的失败重试也没意义（manual disable / 打错模型名 / 参数被拒）。
+  if (!(drainSkipped > 0 || poolEmpty) || Date.now() >= waitDeadline) break;
+  const waitMs = Math.min(roundDelayMs, waitDeadline - Date.now());
+  if (waitMs <= 0) break;
+  log('warn', 'WorkBuddy 两个版本都没容量，等一会儿再试', {
+    model, round: round + 1, waitMs, drainSeconds: Math.ceil(drainSkipped / 1000),
+  });
+  await wbWait(waitMs, res);
+  // 客户端已经走了：别再打上游，也别再写响应
+  if (res.writableEnded || res.destroyed) return;
+  roundDelayMs = Math.min(roundDelayMs * 2, 3000);
+  lastError = '';
+  lastStatus = 0;
+  poolEmpty = false;
+  }
 
   // 所有渠道都被挡下（积分耗尽 / 出口刚回报整池没号），一次都没真发出去：对外还是
   // 通用话术，原因（哪个模型、还剩多久）只在服务端的日志与 recent 环里。
-  if (!res.headersSent && (creditParkedAll > 0 || drainSkipped > 0) && !lastStatus && !lastError) {
+  if (!res.headersSent && (creditParkedAll > 0 || drainSkipped > 0 || poolEmpty) && !lastStatus && !lastError) {
     log('warn', 'WorkBuddy 全部出口都被跳过', {
       model,
       creditParkedMinutes: creditParkedAll ? Math.ceil(creditParkedAll / 60000) : 0,
       drainSeconds: drainSkipped ? Math.ceil(drainSkipped / 1000) : 0,
+      poolEmpty,
     });
     return sendJSON(res, 503, {
       error: { message: WB_UNAVAILABLE, type: 'server_error' },
-      retry_after: Math.max(1, Math.ceil((creditParkedAll || drainSkipped) / 1000)),
+      retry_after: Math.max(1, Math.ceil((creditParkedAll || drainSkipped || 5000) / 1000)),
     });
   }
 
